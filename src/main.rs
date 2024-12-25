@@ -7,5 +7,5 @@ use options::Options;
 
 fn main() -> Result<()> {
     let opt = Options::parse();
-    aggregate::aggregate(opt)
+    aggregate::run(opt)
 }
