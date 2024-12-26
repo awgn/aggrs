@@ -1,5 +1,6 @@
 mod options;
 mod aggregate;
+mod visitors;
 
 use anyhow::Result;
 use clap::Parser;

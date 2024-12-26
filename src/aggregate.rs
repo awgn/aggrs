@@ -1,18 +1,17 @@
 use anyhow::Result;
-use serde::de::{MapAccess, Visitor};
-use std::collections::HashSet;
-use std::fmt;
+use csv::{ReaderBuilder, StringRecord};
+use std::path::PathBuf;
 use std::{collections::HashMap, io::BufRead};
 
-use crate::options::{AggrKeys, Options};
 use colored::Colorize;
 use rayon::prelude::*;
-use serde_json::Value;
-
-use serde::Deserializer;
+use serde_json::{to_string, Value};
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::options::Options;
+use crate::visitors::{parse_selected_keys, SelectiveVisitor};
 
 #[derive(Debug, Default)]
 struct AggregateMap(HashMap<Value, AggregateData>);
@@ -96,7 +95,7 @@ impl AggregateMap {
                     )
                     .unwrap();
                 }
-                writeln!(stdout, ": {}", k).unwrap();
+                writeln!(stdout, ": {}", colorize(&k.to_string(), opt)).unwrap();
             }
 
             if let Some(buckets) = &v.buckets {
@@ -105,28 +104,44 @@ impl AggregateMap {
         }
     }
 
-    fn aggregate_file(self, file: String, opt: &Options) -> Result<(AggregateMap, u64)> {
-        let keys = AggrKeys::new(opt)?;
-
+    fn aggregate_file(self, file: PathBuf, opt: &Options) -> Result<(AggregateMap, u64)> {
         let entries = AtomicU64::new(0);
         let v = std::io::BufReader::new(std::fs::File::open(file)?)
             .lines()
             .collect::<Result<Vec<_>, _>>()?;
 
-        let visitor = match &keys {
-            AggrKeys::Keys(vec) => Some(SelectiveVisitor::new(vec.clone())),
-            AggrKeys::Text(_) => None,
-        };
+        let visitor = ParserData::new(opt)?;
 
-        let map = v
-            .par_iter()
+        let mut iter = v.iter();
+
+        // skip the first line if it's a CSV header
+        if matches!(visitor, ParserData::Csv(_)) {
+            iter.next();
+        }
+
+        let map = iter
+            .par_bridge()
             .fold(AggregateMap::default, |mut amap, line| {
                 if line.starts_with('#') {
                     return amap;
                 }
-                entries.fetch_add(1, Ordering::Relaxed);
 
-                let values = parse_line(line, visitor.clone(), &keys).unwrap();
+                let values = parse_line(line, visitor.clone()).unwrap();
+
+                if let Some(filter) = &opt.filter {
+                    if !filter.is_match(
+                        &values
+                            .iter()
+                            .map(to_string)
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap()
+                            .join(" "),
+                    ) {
+                        return amap;
+                    }
+                }
+
+                entries.fetch_add(1, Ordering::Relaxed);
                 amap.insert(values);
                 amap
             })
@@ -139,52 +154,135 @@ impl AggregateMap {
     }
 
     fn aggregate_stdin(self, opt: &Options) -> Result<(AggregateMap, u64)> {
-        let keys = AggrKeys::new(opt)?;
-
-        let v = std::io::stdin().lock()
-            .lines();
-
+        let v = std::io::stdin().lock().lines();
         let entries = AtomicU64::new(0);
+        let visitor = ParserData::new(opt)?;
 
-        let visitor = match opt.keys.is_empty() {
-            true => None,
-            false => Some(SelectiveVisitor::new(opt.keys.clone())),
-        };
+        let map = v.fold(AggregateMap::default(), |mut amap, line| {
+            let line = line.unwrap();
+            if line.starts_with('#') {
+                return amap;
+            }
 
-        let map = v
-            .fold(AggregateMap::default(), |mut amap, line| {
-                let line = line.unwrap();
-                if line.starts_with('#') {
-                    return amap;
-                }
+            entries.fetch_add(1, Ordering::Relaxed);
 
-                entries.fetch_add(1, Ordering::Relaxed);
-
-                let values = parse_line(&line, visitor.clone(), &keys).unwrap();
-                amap.insert(values);
-                amap
-            });
+            let values = parse_line(&line, visitor.clone()).unwrap();
+            amap.insert(values);
+            amap
+        });
 
         Ok((map, entries.load(Ordering::Relaxed)))
     }
 }
 
+#[derive(Debug, Clone)]
+enum ParserType {
+    Json,
+    Csv,
+    Text,
+}
+
+#[derive(Debug, Clone)]
+enum ParserData {
+    Json((SelectiveVisitor, Vec<String>)),
+    Csv(Vec<usize>),
+    Text(bool),
+}
+
+impl ParserData {
+    fn new(opt: &Options) -> Result<Self> {
+        let par_type = if opt.keys.is_empty() {
+            ParserType::Text
+        } else if let Some(format) = &opt.file_format {
+            match format.as_str() {
+                "json" => ParserType::Json,
+                "csv" => ParserType::Csv,
+                _ => return Err(anyhow::anyhow!("Invalid file format")),
+            }
+        } else {
+            // try deduce format from file extension
+            if let Some(file) = &opt.file {
+                let filename = file.display().to_string();
+                let ext = filename
+                    .split('.')
+                    .last()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid file format"))?;
+
+                match ext {
+                    "csv" => ParserType::Csv,
+                    _ => ParserType::Json, // default to json
+                }
+            } else {
+                ParserType::Json
+            }
+        };
+
+        match par_type {
+            ParserType::Json => Ok(ParserData::Json((
+                SelectiveVisitor::new(opt.keys.clone()),
+                opt.keys.clone(),
+            ))),
+            ParserType::Csv => {
+                let record = Self::get_string_record(
+                    &opt.file
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("file name not specified"))?,
+                )?;
+
+                let pos = opt
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        record
+                            .iter()
+                            .position(|r| r == k)
+                            .ok_or_else(|| anyhow::anyhow!("key not found"))
+                    })
+                    .collect::<Result<Vec<usize>, _>>()?;
+
+                Ok(ParserData::Csv(pos))
+            }
+            ParserType::Text => Ok(ParserData::Text(opt.tokenise)),
+        }
+    }
+
+    fn get_string_record(file: &PathBuf) -> Result<StringRecord> {
+        let file = std::fs::File::open(file)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(line.as_bytes());
+        Ok(rdr.headers()?.iter().map(|h| h.to_string()).collect())
+    }
+}
 
 pub fn run(opt: Options) -> Result<()> {
+    if let Some(nt) = opt.num_threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(nt)
+            .build_global()?;
+    }
+
+    let start = std::time::Instant::now();
+
     let (amap, entries) = match &opt.file {
-        Some(file) => AggregateMap::new()
-            .aggregate_file(file.clone(), &opt)?,
-        None => AggregateMap::new()
-            .aggregate_stdin(&opt)?
+        Some(file) => AggregateMap::new().aggregate_file(file.clone(), &opt)?,
+        None => AggregateMap::new().aggregate_stdin(&opt)?,
     };
+
+    let elapsed = start.elapsed();
 
     amap.print(0, &opt);
 
     println!("buckets      : {}", amap.0.len());
     println!("total entries: {}", entries);
+    println!("time elapsed : {:.2?}", elapsed);
+
     Ok(())
 }
-
 
 #[inline]
 fn colorize(s: &str, opt: &Options) -> String {
@@ -196,13 +294,29 @@ fn colorize(s: &str, opt: &Options) -> String {
 }
 
 #[inline]
-fn parse_line(line: &str, visitor: Option<SelectiveVisitor>, keys: &AggrKeys) -> Result<Vec<Value>> {
-    match &keys {
-        AggrKeys::Keys(_) => {
-            Ok(parse_selected_keys(line, visitor.unwrap())?)
+fn parse_line(line: &str, visitor: ParserData) -> Result<Vec<Value>> {
+    match visitor {
+        ParserData::Json((parser, _)) => Ok(parse_selected_keys(line, parser)?),
+        ParserData::Csv(pos) => {
+            let mut rdr = ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(line.as_bytes());
+
+            let mut res = Vec::with_capacity(pos.len());
+
+            let record = rdr
+                .records()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))??;
+
+            for p in pos {
+                res.push(Value::String(record.get(p).unwrap().to_string()));
+            }
+
+            Ok(res)
         }
-        AggrKeys::Text(tok) => {
-            if *tok {
+        ParserData::Text(tok) => {
+            if tok {
                 Ok(line
                     .split_whitespace()
                     .map(|s| Value::String(s.to_string()))
@@ -212,62 +326,4 @@ fn parse_line(line: &str, visitor: Option<SelectiveVisitor>, keys: &AggrKeys) ->
             }
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct SelectiveVisitor {
-    keys: HashSet<String>,
-    values: Vec<serde_json::Value>,
-}
-
-impl SelectiveVisitor {
-    fn new(keys: Vec<String>) -> Self {
-        Self {
-            values: Vec::with_capacity(keys.len()),
-            keys: keys.into_iter().collect(),
-        }
-    }
-}
-
-impl<'de> Visitor<'de> for SelectiveVisitor {
-    type Value = Vec<serde_json::Value>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a JSON object")
-    }
-
-    fn visit_map<M>(mut self, mut access: M) -> Result<Self::Value, M::Error>
-    where
-        M: MapAccess<'de>,
-    {
-        while let Some(key) = access.next_key::<String>()? {
-            if self.keys.contains(&key) {
-                let value = access.next_value::<serde_json::Value>()?;
-                self.values.push(value);
-
-                if self.values.len() == self.keys.len() {
-                    // Consume the rest of the input without parsing it
-                    while access.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
-                    return Ok(self.values);
-                }
-            } else {
-                // Skip values for keys we don't care about
-                access.next_value::<serde::de::IgnoredAny>()?;
-            }
-        }
-        Ok(self.values)
-    }
-}
-
-fn parse_selected_keys(
-    json: &str,
-    visitor: SelectiveVisitor,
-) -> Result<Vec<serde_json::Value>, serde_json::Error> {
-    let deserializer = &mut serde_json::Deserializer::from_str(json);
-    let result = deserializer.deserialize_map(visitor)?;
-
-    // Consume any remaining whitespace or trailing characters
-    deserializer.end()?;
-
-    Ok(result)
 }
