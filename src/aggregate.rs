@@ -11,7 +11,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::options::Options;
-use crate::visitors::{parse_selected_keys, SelectiveVisitor};
+use crate::visitors::SelectiveVisitor;
 
 #[derive(Debug, Default)]
 struct AggregateMap(HashMap<Value, AggregateData>);
@@ -107,6 +107,8 @@ impl AggregateMap {
     fn aggregate_input(self, opt: &Options) -> Result<(AggregateMap, u64)> {
         let entries = AtomicU64::new(0);
 
+        let visitor = Visitor::new(opt)?;
+
         let v = match &opt.file {
             Some(file) => {
                 std::io::BufReader::new(std::fs::File::open(file)?)
@@ -117,8 +119,6 @@ impl AggregateMap {
                 std::io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()?
             }
         };
-
-        let visitor = Visitor::new(opt)?;
 
         let mut iter = v.iter();
 
@@ -171,7 +171,7 @@ enum ParserType {
 
 #[derive(Debug, Clone)]
 enum Visitor {
-    Json((SelectiveVisitor, Vec<String>)),
+    Json(SelectiveVisitor),
     Csv(Vec<usize>),
     Text(bool),
 }
@@ -205,10 +205,7 @@ impl Visitor {
         };
 
         match par_type {
-            ParserType::Json => Ok(Visitor::Json((
-                SelectiveVisitor::new(opt.keys.clone()),
-                opt.keys.clone(),
-            ))),
+            ParserType::Json => Ok(Visitor::Json(SelectiveVisitor::new(opt.keys.clone()))),
             ParserType::Csv => {
                 let record = Self::get_string_record(
                     &opt.file
@@ -254,9 +251,7 @@ pub fn run(opt: Options) -> Result<()> {
     }
 
     let start = std::time::Instant::now();
-
     let (amap, entries) = AggregateMap::new().aggregate_input(&opt)?;
-
     let elapsed = start.elapsed();
 
     amap.print(0, &opt);
@@ -280,7 +275,7 @@ fn colorize(s: &str, opt: &Options) -> String {
 #[inline]
 fn parse_line(line: &str, visitor: &Visitor) -> Result<Vec<Value>> {
     match visitor {
-        Visitor::Json((parser, _)) => Ok(parse_selected_keys(line, parser.clone())?),
+        Visitor::Json(visitor) => Ok(visitor.clone().parse_keys(line)?),
         Visitor::Csv(pos) => {
             let mut rdr = ReaderBuilder::new()
                 .has_headers(false)
