@@ -104,18 +104,26 @@ impl AggregateMap {
         }
     }
 
-    fn aggregate_file(self, file: PathBuf, opt: &Options) -> Result<(AggregateMap, u64)> {
+    fn aggregate_input(self, opt: &Options) -> Result<(AggregateMap, u64)> {
         let entries = AtomicU64::new(0);
-        let v = std::io::BufReader::new(std::fs::File::open(file)?)
-            .lines()
-            .collect::<Result<Vec<_>, _>>()?;
 
-        let visitor = ParserData::new(opt)?;
+        let v = match &opt.file {
+            Some(file) => {
+                std::io::BufReader::new(std::fs::File::open(file)?)
+                .lines()
+                .collect::<Result<Vec<_>, _>>()?
+            },
+            None => {
+                std::io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        let visitor = Visitor::new(opt)?;
 
         let mut iter = v.iter();
 
         // skip the first line if it's a CSV header
-        if matches!(visitor, ParserData::Csv(_)) {
+        if matches!(visitor, Visitor::Csv(_)) {
             iter.next();
         }
 
@@ -126,7 +134,7 @@ impl AggregateMap {
                     return amap;
                 }
 
-                let values = parse_line(line, visitor.clone()).unwrap();
+                let values = parse_line(line, &visitor).unwrap();
 
                 if let Some(filter) = &opt.filter {
                     if !filter.is_match(
@@ -152,27 +160,6 @@ impl AggregateMap {
 
         Ok((map, entries.load(Ordering::Relaxed)))
     }
-
-    fn aggregate_stdin(self, opt: &Options) -> Result<(AggregateMap, u64)> {
-        let v = std::io::stdin().lock().lines();
-        let entries = AtomicU64::new(0);
-        let visitor = ParserData::new(opt)?;
-
-        let map = v.fold(AggregateMap::default(), |mut amap, line| {
-            let line = line.unwrap();
-            if line.starts_with('#') {
-                return amap;
-            }
-
-            entries.fetch_add(1, Ordering::Relaxed);
-
-            let values = parse_line(&line, visitor.clone()).unwrap();
-            amap.insert(values);
-            amap
-        });
-
-        Ok((map, entries.load(Ordering::Relaxed)))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,13 +170,13 @@ enum ParserType {
 }
 
 #[derive(Debug, Clone)]
-enum ParserData {
+enum Visitor {
     Json((SelectiveVisitor, Vec<String>)),
     Csv(Vec<usize>),
     Text(bool),
 }
 
-impl ParserData {
+impl Visitor {
     fn new(opt: &Options) -> Result<Self> {
         let par_type = if opt.keys.is_empty() {
             ParserType::Text
@@ -218,7 +205,7 @@ impl ParserData {
         };
 
         match par_type {
-            ParserType::Json => Ok(ParserData::Json((
+            ParserType::Json => Ok(Visitor::Json((
                 SelectiveVisitor::new(opt.keys.clone()),
                 opt.keys.clone(),
             ))),
@@ -240,9 +227,9 @@ impl ParserData {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
 
-                Ok(ParserData::Csv(pos))
+                Ok(Visitor::Csv(pos))
             }
-            ParserType::Text => Ok(ParserData::Text(opt.tokenise)),
+            ParserType::Text => Ok(Visitor::Text(opt.tokenise)),
         }
     }
 
@@ -268,10 +255,7 @@ pub fn run(opt: Options) -> Result<()> {
 
     let start = std::time::Instant::now();
 
-    let (amap, entries) = match &opt.file {
-        Some(file) => AggregateMap::new().aggregate_file(file.clone(), &opt)?,
-        None => AggregateMap::new().aggregate_stdin(&opt)?,
-    };
+    let (amap, entries) = AggregateMap::new().aggregate_input(&opt)?;
 
     let elapsed = start.elapsed();
 
@@ -294,10 +278,10 @@ fn colorize(s: &str, opt: &Options) -> String {
 }
 
 #[inline]
-fn parse_line(line: &str, visitor: ParserData) -> Result<Vec<Value>> {
+fn parse_line(line: &str, visitor: &Visitor) -> Result<Vec<Value>> {
     match visitor {
-        ParserData::Json((parser, _)) => Ok(parse_selected_keys(line, parser)?),
-        ParserData::Csv(pos) => {
+        Visitor::Json((parser, _)) => Ok(parse_selected_keys(line, parser.clone())?),
+        Visitor::Csv(pos) => {
             let mut rdr = ReaderBuilder::new()
                 .has_headers(false)
                 .from_reader(line.as_bytes());
@@ -310,13 +294,13 @@ fn parse_line(line: &str, visitor: ParserData) -> Result<Vec<Value>> {
                 .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))??;
 
             for p in pos {
-                res.push(Value::String(record.get(p).unwrap().to_string()));
+                res.push(Value::String(record.get(*p).unwrap().to_string()));
             }
 
             Ok(res)
         }
-        ParserData::Text(tok) => {
-            if tok {
+        Visitor::Text(tok) => {
+            if *tok {
                 Ok(line
                     .split_whitespace()
                     .map(|s| Value::String(s.to_string()))
