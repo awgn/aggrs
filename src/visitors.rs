@@ -15,7 +15,7 @@ impl SelectiveVisitor {
         }
     }
 
-    pub fn parse_keys(
+    pub fn get_values_by_keys(
         self,
         json: &str,
     ) -> Result<Vec<serde_json::Value>, serde_json::Error> {
@@ -61,5 +61,32 @@ impl<'de> Visitor<'de> for SelectiveVisitor {
             }
         }
         Ok(values)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RegexVisitor {
+    pub expr: regex::Regex,
+}
+
+impl RegexVisitor {
+    pub fn new(expr: regex::Regex) -> Self {
+        Self {
+            expr
+        }
+    }
+
+    pub fn get_keys_by_regex(
+        self,
+        json: &str,
+    ) -> Result<Vec<(String, serde_json::Value)>, serde_json::Error> {
+        let mut result = vec![];
+        let doc : serde_json::Value = serde_json::from_str(json)?;
+        for (key, value) in doc.as_object().unwrap().iter() {
+            if self.expr.is_match(&value.to_string()) {
+                result.push((key.clone(), value.clone()));
+            }
+        }
+        Ok(result)
     }
 }

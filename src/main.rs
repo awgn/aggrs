@@ -1,6 +1,8 @@
 mod options;
 mod aggregate;
+mod discovery;
 mod visitors;
+mod merge;
 
 use anyhow::Result;
 use clap::Parser;
@@ -8,5 +10,12 @@ use options::Options;
 
 fn main() -> Result<()> {
     let opt = Options::parse();
-    aggregate::run(opt)
+    match opt.discovery {
+        Some(_) => {
+            discovery::run(opt)
+        }
+        None => {
+            aggregate::run(opt)
+        }
+    }
 }

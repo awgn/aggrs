@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-
+use colored::Colorize;
 use clap::Parser;
 
 #[derive(Parser, Default, Debug)]
@@ -23,6 +23,9 @@ pub struct Options {
     #[clap(short, long, help = "Filter buckets by regular expression")]
     pub filter: Option<regex::Regex>,
 
+    #[clap(short, long, help = "Discovery keys matching regular expression on values")]
+    pub discovery: Option<regex::Regex>,
+
     #[clap(short = 'j', long, help = "Specify the number of threads")]
     pub num_threads: Option<usize>,
 
@@ -33,4 +36,15 @@ pub struct Options {
     pub verbose: bool,
 
     pub file: Option<PathBuf>,
+}
+
+impl Options {
+    #[inline]
+    pub fn colorize(&self, s: &str) -> String {
+        if self.colors {
+            s.blue().to_string()
+        } else {
+            s.to_string()
+        }
+    }
 }

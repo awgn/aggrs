@@ -3,23 +3,46 @@ use csv::{ReaderBuilder, StringRecord};
 use std::path::PathBuf;
 use std::{collections::HashMap, io::BufRead};
 
-use colored::Colorize;
-use rayon::prelude::*;
 use serde_json::{to_string, Value};
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::merge::Merge;
 use crate::options::Options;
 use crate::visitors::SelectiveVisitor;
+use rayon::prelude::*;
 
-#[derive(Debug, Default)]
+
+#[derive(Debug, Default, Clone)]
 struct AggregateMap(HashMap<Value, AggregateData>);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct AggregateData {
     count: u64,
     buckets: Option<Box<AggregateMap>>,
+}
+
+
+impl Merge for AggregateMap {
+    fn merge(&mut self, other: Self) {
+        for (key, other_data) in other.0 {
+            let entry = self.0.entry(key.clone()).or_insert_with(|| AggregateData {
+                count: 0,
+                buckets: Some(Box::new(AggregateMap::new())),
+            });
+
+            entry.count += other_data.count;
+
+            if let Some(other_buckets) = other_data.buckets {
+                if let Some(entry_buckets) = &mut entry.buckets {
+                    entry_buckets.merge(other_buckets.as_ref().clone());
+                } else {
+                    entry.buckets = Some(other_buckets);
+                }
+            }
+        }
+    }
 }
 
 impl AggregateMap {
@@ -42,25 +65,6 @@ impl AggregateMap {
         }
     }
 
-    fn merge(&mut self, other: AggregateMap) {
-        for (key, other_data) in other.0 {
-            let entry = self.0.entry(key).or_insert_with(|| AggregateData {
-                count: 0,
-                buckets: Some(Box::new(AggregateMap::new())),
-            });
-
-            entry.count += other_data.count;
-
-            if let Some(other_buckets) = other_data.buckets {
-                if let Some(entry_buckets) = &mut entry.buckets {
-                    entry_buckets.merge(*other_buckets);
-                } else {
-                    entry.buckets = Some(other_buckets);
-                }
-            }
-        }
-    }
-
     fn print(&self, level: i32, opt: &Options) {
         let mut pairs = Vec::with_capacity(self.0.len());
         let mut total_count: u64 = 0;
@@ -76,7 +80,7 @@ impl AggregateMap {
         for (k, v) in pairs {
             write!(stdout, "{}", " ".repeat(level as usize)).unwrap();
             if opt.counters_to_right {
-                write!(stdout, "{} -> {}", colorize(&k.to_string(), opt), v.count).unwrap();
+                write!(stdout, "{} -> {}", opt.colorize(&k.to_string()), v.count).unwrap();
                 if opt.verbose {
                     writeln!(
                         stdout,
@@ -95,7 +99,7 @@ impl AggregateMap {
                     )
                     .unwrap();
                 }
-                writeln!(stdout, ": {}", colorize(&k.to_string(), opt)).unwrap();
+                writeln!(stdout, ": {}", opt.colorize(&k.to_string())).unwrap();
             }
 
             if let Some(buckets) = &v.buckets {
@@ -104,10 +108,10 @@ impl AggregateMap {
         }
     }
 
-    fn aggregate_input(self, opt: &Options) -> Result<(AggregateMap, u64)> {
+    fn aggregate(self, opt: &Options) -> Result<(AggregateMap, u64)> {
         let entries = AtomicU64::new(0);
 
-        let visitor = Visitor::new(opt)?;
+        let visitor = Aggregate::new(opt)?;
 
         let v = match &opt.file {
             Some(file) => {
@@ -123,7 +127,7 @@ impl AggregateMap {
         let mut iter = v.iter();
 
         // skip the first line if it's a CSV header
-        if matches!(visitor, Visitor::Csv(_)) {
+        if matches!(visitor, Aggregate::Csv(_)) {
             iter.next();
         }
 
@@ -134,7 +138,7 @@ impl AggregateMap {
                     return amap;
                 }
 
-                let values = parse_line(line, &visitor).unwrap();
+                let values = visitor.parse_values(line).unwrap();
 
                 if let Some(filter) = &opt.filter {
                     if !filter.is_match(
@@ -170,13 +174,13 @@ enum ParserType {
 }
 
 #[derive(Debug, Clone)]
-enum Visitor {
+enum Aggregate {
     Json(SelectiveVisitor),
     Csv(Vec<usize>),
     Text(bool),
 }
 
-impl Visitor {
+impl Aggregate {
     fn new(opt: &Options) -> Result<Self> {
         let par_type = if opt.keys.is_empty() {
             ParserType::Text
@@ -205,7 +209,7 @@ impl Visitor {
         };
 
         match par_type {
-            ParserType::Json => Ok(Visitor::Json(SelectiveVisitor::new(opt.keys.clone()))),
+            ParserType::Json => Ok(Aggregate::Json(SelectiveVisitor::new(opt.keys.clone()))),
             ParserType::Csv => {
                 let record = Self::get_string_record(
                     &opt.file
@@ -224,9 +228,9 @@ impl Visitor {
                     })
                     .collect::<Result<Vec<usize>, _>>()?;
 
-                Ok(Visitor::Csv(pos))
+                Ok(Aggregate::Csv(pos))
             }
-            ParserType::Text => Ok(Visitor::Text(opt.tokenise)),
+            ParserType::Text => Ok(Aggregate::Text(opt.tokenise)),
         }
     }
 
@@ -241,6 +245,41 @@ impl Visitor {
             .from_reader(line.as_bytes());
         Ok(rdr.headers()?.iter().map(|h| h.to_string()).collect())
     }
+
+    #[inline]
+    fn parse_values(&self, line: &str) -> Result<Vec<Value>> {
+        match self {
+            Aggregate::Json(visitor) => Ok(visitor.clone().get_values_by_keys(line)?),
+            Aggregate::Csv(pos) => {
+                let mut rdr = ReaderBuilder::new()
+                    .has_headers(false)
+                    .from_reader(line.as_bytes());
+
+                let mut res = Vec::with_capacity(pos.len());
+
+                let record = rdr
+                    .records()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))??;
+
+                for p in pos {
+                    res.push(Value::String(record.get(*p).unwrap().to_string()));
+                }
+
+                Ok(res)
+            }
+            Aggregate::Text(tok) => {
+                if *tok {
+                    Ok(line
+                        .split_whitespace()
+                        .map(|s| Value::String(s.to_string()))
+                        .collect())
+                } else {
+                    Ok(vec![Value::String(line.to_string().clone())])
+                }
+            }
+        }
+    }
 }
 
 pub fn run(opt: Options) -> Result<()> {
@@ -251,7 +290,7 @@ pub fn run(opt: Options) -> Result<()> {
     }
 
     let start = std::time::Instant::now();
-    let (amap, entries) = AggregateMap::new().aggregate_input(&opt)?;
+    let (amap, entries) = AggregateMap::new().aggregate(&opt)?;
     let elapsed = start.elapsed();
 
     amap.print(0, &opt);
@@ -261,48 +300,4 @@ pub fn run(opt: Options) -> Result<()> {
     println!("time elapsed : {:.2?}", elapsed);
 
     Ok(())
-}
-
-#[inline]
-fn colorize(s: &str, opt: &Options) -> String {
-    if opt.colors {
-        s.blue().to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-#[inline]
-fn parse_line(line: &str, visitor: &Visitor) -> Result<Vec<Value>> {
-    match visitor {
-        Visitor::Json(visitor) => Ok(visitor.clone().parse_keys(line)?),
-        Visitor::Csv(pos) => {
-            let mut rdr = ReaderBuilder::new()
-                .has_headers(false)
-                .from_reader(line.as_bytes());
-
-            let mut res = Vec::with_capacity(pos.len());
-
-            let record = rdr
-                .records()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))??;
-
-            for p in pos {
-                res.push(Value::String(record.get(*p).unwrap().to_string()));
-            }
-
-            Ok(res)
-        }
-        Visitor::Text(tok) => {
-            if *tok {
-                Ok(line
-                    .split_whitespace()
-                    .map(|s| Value::String(s.to_string()))
-                    .collect())
-            } else {
-                Ok(vec![Value::String(line.to_string().clone())])
-            }
-        }
-    }
 }
