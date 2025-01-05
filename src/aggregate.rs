@@ -12,7 +12,7 @@ use crate::merge::Merge;
 use crate::options::Options;
 use crate::visitors::SelectiveVisitor;
 use rayon::prelude::*;
-
+use scopeguard::defer;
 
 #[derive(Debug, Default, Clone)]
 struct AggregateMap(HashMap<Value, AggregateData>);
@@ -290,14 +290,17 @@ pub fn run(opt: Options) -> Result<()> {
     }
 
     let start = std::time::Instant::now();
+    defer! {
+        let elapsed = start.elapsed();
+        println!("time elapsed : {:.2?}", elapsed);
+    }
+
     let (amap, entries) = AggregateMap::new().aggregate(&opt)?;
-    let elapsed = start.elapsed();
 
     amap.print(0, &opt);
 
     println!("buckets      : {}", amap.0.len());
     println!("total entries: {}", entries);
-    println!("time elapsed : {:.2?}", elapsed);
 
     Ok(())
 }

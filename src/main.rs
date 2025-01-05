@@ -7,6 +7,7 @@ mod merge;
 use anyhow::Result;
 use clap::Parser;
 use options::Options;
+extern crate scopeguard;
 
 fn main() -> Result<()> {
     let opt = Options::parse();
