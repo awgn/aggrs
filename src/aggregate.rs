@@ -25,8 +25,8 @@ struct AggregateData {
 
 
 impl Merge for AggregateMap {
-    fn merge(&mut self, other: Self) {
-        for (key, other_data) in other.0 {
+    fn merge(&mut self, other: &Self) {
+        for (key, other_data) in &other.0 {
             let entry = self.0.entry(key.clone()).or_insert_with(|| AggregateData {
                 count: 0,
                 buckets: Some(Box::new(AggregateMap::new())),
@@ -34,11 +34,11 @@ impl Merge for AggregateMap {
 
             entry.count += other_data.count;
 
-            if let Some(other_buckets) = other_data.buckets {
+            if let Some(other_buckets) = &other_data.buckets {
                 if let Some(entry_buckets) = &mut entry.buckets {
-                    entry_buckets.merge(other_buckets.as_ref().clone());
+                    entry_buckets.merge(other_buckets.as_ref());
                 } else {
-                    entry.buckets = Some(other_buckets);
+                    entry.buckets = Some(other_buckets.clone());
                 }
             }
         }
@@ -158,7 +158,7 @@ impl AggregateMap {
                 amap
             })
             .reduce(AggregateMap::default, |mut amap, b| {
-                amap.merge(b);
+                amap.merge(&b);
                 amap
             });
 

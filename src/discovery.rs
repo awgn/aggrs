@@ -36,9 +36,9 @@ impl Discovery {
 struct DiscoveryMap(HashMap<String, HashMap<Value, u64>>);
 
 impl Merge for DiscoveryMap {
-    fn merge(&mut self, other: Self) {
-        for (key, other_values) in other.0 {
-            let entry = self.0.entry(key).or_default();
+    fn merge(&mut self, other: &Self) {
+        for (key, other_values) in &other.0 {
+            let entry = self.0.entry(key.clone()).or_default();
             entry.merge(other_values);
         }
     }
@@ -114,7 +114,7 @@ impl DiscoveryMap {
                 dmap
             })
             .reduce(DiscoveryMap::default, |mut dmap, b| {
-                dmap.merge(b);
+                dmap.merge(&b);
                 dmap
             });
 
