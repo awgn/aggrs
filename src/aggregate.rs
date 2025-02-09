@@ -88,6 +88,8 @@ impl AggregateMap {
                         (v.count as f64 / total_count as f64) * 100.0
                     )
                     .unwrap();
+                } else {
+                    writeln!(stdout).unwrap();
                 }
             } else {
                 write!(stdout, "{}", v.count).unwrap();
