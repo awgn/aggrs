@@ -1,16 +1,20 @@
 use anyhow::Result;
 use serde::de::{MapAccess, Visitor};
 use serde::Deserializer;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::{collections::BTreeSet, fmt};
 
 #[derive(Debug, Clone)]
 pub struct SelectiveVisitor {
+    pub orig_keys: Vec<String>,
     pub keys: BTreeSet<String>,
 }
 
 impl SelectiveVisitor {
     pub fn new(keys: Vec<String>) -> Self {
         Self {
+            orig_keys: keys.clone(),
             keys: keys.into_iter().collect(),
         }
     }
@@ -40,12 +44,12 @@ impl<'de> Visitor<'de> for SelectiveVisitor {
     where
         M: MapAccess<'de>,
     {
-        let mut values = Vec::with_capacity(self.keys.len());
+        let mut values = BTreeMap::new();
 
         while let Some(key) = access.next_key::<&str>()? {
             if self.keys.contains(key) {
                 let value = access.next_value::<serde_json::Value>()?;
-                values.push(value);
+                values.insert(key.to_owned(), value);
 
                 if values.len() == self.keys.len() {
                     // Consume the rest of the input without parsing it
@@ -53,14 +57,25 @@ impl<'de> Visitor<'de> for SelectiveVisitor {
                         .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
                         .is_some()
                     {}
-                    return Ok(values);
+
+                    // return the values in the order of the original keys...
+                    return Ok(self
+                        .orig_keys
+                        .iter()
+                        .map(|key| values.remove(key).unwrap_or(Value::Null))
+                        .collect());
                 }
             } else {
                 // Skip values for keys we don't care about
                 access.next_value::<serde::de::IgnoredAny>()?;
             }
         }
-        Ok(values)
+
+        Ok(self
+            .orig_keys
+            .iter()
+            .map(|key| values.remove(key).unwrap_or(Value::Null))
+            .collect())
     }
 }
 
