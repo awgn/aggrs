@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::de::{MapAccess, Visitor};
+use serde::de::{MapAccess, Visitor, Error};
 use serde::Deserializer;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -8,14 +8,14 @@ use std::{collections::BTreeSet, fmt};
 #[derive(Debug, Clone)]
 pub struct SelectiveVisitor {
     pub orig_keys: Vec<String>,
-    pub keys: BTreeSet<String>,
+    pub root_keys: BTreeSet<String>,
 }
 
 impl SelectiveVisitor {
     pub fn new(keys: Vec<String>) -> Self {
         Self {
             orig_keys: keys.clone(),
-            keys: keys.into_iter().collect(),
+            root_keys: keys.into_iter().map(|k| get_root_key(&k).to_owned()).collect(),
         }
     }
 
@@ -47,11 +47,25 @@ impl<'de> Visitor<'de> for SelectiveVisitor {
         let mut values = BTreeMap::new();
 
         while let Some(key) = access.next_key::<&str>()? {
-            if self.keys.contains(key) {
+            if self.root_keys.contains(key) {
                 let value = access.next_value::<serde_json::Value>()?;
-                values.insert(key.to_owned(), value);
+                let mut value_str : Option<String> = None;
 
-                if values.len() == self.keys.len() {
+                for cur_key in get_keys_by_root(key, self.orig_keys.clone()).iter() {
+                    if is_multi_level_key(cur_key)   {
+                        let json = value_str.get_or_insert_with(|| {
+                            serde_json::to_string(&value).unwrap()
+                        });
+
+                        let value = parse_multi_level_key(get_sub_keys(cur_key), json).map_err(M::Error::custom)?;
+                        values.insert(cur_key.to_owned(), value.clone());
+
+                    } else {
+                        values.insert(cur_key.to_owned(), value.clone());
+                    }
+                }
+
+                if values.len() == self.root_keys.len() {
                     // Consume the rest of the input without parsing it
                     while access
                         .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
@@ -103,5 +117,78 @@ impl RegexVisitor {
             }
         }
         Ok(result)
+    }
+}
+
+#[inline]
+fn get_keys_by_root(root: &str, keys: Vec<String>) -> Vec<String> {
+    keys.into_iter().filter(|k| get_root_key(k) == root).collect()
+}
+
+#[inline]
+fn get_root_key(key : &str) -> &str {
+    key.split('.').next().unwrap()
+}
+
+#[inline]
+fn get_sub_keys(key : &str) -> Vec<&str> {
+    key.split('.').skip(1).collect()
+}
+
+#[inline]
+fn is_multi_level_key(key : &str) -> bool {
+    key.contains('.')
+}
+
+#[inline]
+fn parse_multi_level_key(keys : Vec<&str>, json : &str) -> Result<serde_json::Value> {
+    let mut doc : serde_json::Value = serde_json::from_str(json)?;
+    for k in keys {
+        doc = doc.get(k).ok_or(anyhow::anyhow!("Key not found"))?.clone();
+    }
+
+    Ok(doc)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_key_basic() {
+        let key = "a";
+        let root_key = super::get_root_key(key);
+        assert_eq!(root_key, "a");
+    }
+
+    #[test]
+    fn root_key() {
+        let key = "a.b.c";
+        let root_key = super::get_root_key(key);
+        assert_eq!(root_key, "a");
+    }
+
+    #[test]
+    fn sub_keys() {
+        let key = "a.b.c";
+        let sub_keys = super::get_sub_keys(key);
+        assert_eq!(sub_keys, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn sub_keys_empty() {
+        let key = "a";
+        let sub_keys = super::get_sub_keys(key);
+        assert!(sub_keys.is_empty());
+    }
+
+    #[test]
+    fn parse_multi_level_key() -> Result<()> {
+        let key = "root.b.c";
+        let json = r#"{"b": {"c": 1}}"#;
+        let value = super::parse_multi_level_key(get_sub_keys(key), json)?;
+        assert_eq!(value, serde_json::Value::Number(serde_json::Number::from(1)));
+        Ok(())
     }
 }
