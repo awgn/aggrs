@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::de::{MapAccess, Visitor, Error};
+use serde::de::{MapAccess, Visitor};
 use serde::Deserializer;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -48,31 +48,28 @@ impl<'de> Visitor<'de> for SelectiveVisitor {
 
         while let Some(key) = access.next_key::<&str>()? {
             if self.root_keys.contains(key) {
+                // Deserialize the value for this root key.
                 let value = access.next_value::<serde_json::Value>()?;
-                let mut value_str : Option<String> = None;
 
-                for cur_key in get_keys_by_root(key, self.orig_keys.clone()).iter() {
-                    if is_multi_level_key(cur_key)   {
-                        let json = value_str.get_or_insert_with(|| {
-                            serde_json::to_string(&value).unwrap()
-                        });
-
-                        let value = parse_multi_level_key(get_sub_keys(cur_key), json).map_err(M::Error::custom)?;
-                        values.insert(cur_key.to_owned(), value.clone());
-
+                // Process all requested keys with the same root.
+                for cur_key in get_keys_by_root(key, self.orig_keys.to_vec()) {
+                    if is_multi_level_key(&cur_key) {
+                        // Directly traverse the nested JSON value.
+                        let sub_keys = get_sub_keys(&cur_key);
+                        let nested_value = traverse_value(&value, &sub_keys);
+                        values.insert(cur_key, nested_value);
                     } else {
-                        values.insert(cur_key.to_owned(), value.clone());
+                        // Flat key: just insert the value.
+                        values.insert(cur_key, value.clone());
                     }
                 }
 
-                if values.len() == self.root_keys.len() {
-                    // Consume the rest of the input without parsing it
+                // If we've found values for all root keys, we can exit early.
+                if values.len() >= self.orig_keys.len() {
                     while access
                         .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
                         .is_some()
                     {}
-
-                    // return the values in the order of the original keys...
                     return Ok(self
                         .orig_keys
                         .iter()
@@ -91,6 +88,19 @@ impl<'de> Visitor<'de> for SelectiveVisitor {
             .map(|key| values.remove(key).unwrap_or(Value::Null))
             .collect())
     }
+}
+
+/// Recursively traverses `value` using the provided sub_keys slice.
+/// If any level is missing, returns Value::Null.
+fn traverse_value(value: &Value, sub_keys: &[&str]) -> Value {
+    let mut current = value;
+    for key in sub_keys {
+        current = match current {
+            Value::Object(map) => map.get(*key).unwrap_or(&Value::Null),
+            _ => return Value::Null,
+        };
+    }
+    current.clone()
 }
 
 #[derive(Debug, Clone)]
@@ -140,20 +150,10 @@ fn is_multi_level_key(key : &str) -> bool {
     key.contains('.')
 }
 
-#[inline]
-fn parse_multi_level_key(keys : Vec<&str>, json : &str) -> Result<serde_json::Value> {
-    let mut doc : serde_json::Value = serde_json::from_str(json)?;
-    for k in keys {
-        doc = doc.get(k).ok_or(anyhow::anyhow!("Key not found"))?.clone();
-    }
-
-    Ok(doc)
-}
-
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
 
     #[test]
     fn root_key_basic() {
@@ -181,14 +181,5 @@ mod tests {
         let key = "a";
         let sub_keys = super::get_sub_keys(key);
         assert!(sub_keys.is_empty());
-    }
-
-    #[test]
-    fn parse_multi_level_key() -> Result<()> {
-        let key = "root.b.c";
-        let json = r#"{"b": {"c": 1}}"#;
-        let value = super::parse_multi_level_key(get_sub_keys(key), json)?;
-        assert_eq!(value, serde_json::Value::Number(serde_json::Number::from(1)));
-        Ok(())
     }
 }
