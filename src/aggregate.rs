@@ -232,7 +232,7 @@ impl Aggregate {
 
                 Ok(Aggregate::Csv(pos))
             }
-            ParserType::Text => Ok(Aggregate::Text(opt.tokenise)),
+            ParserType::Text => Ok(Aggregate::Text(opt.tokenize)),
         }
     }
 

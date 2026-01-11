@@ -17,8 +17,8 @@ pub struct Options {
     #[clap(short, long, help = "Specify the JSON/CSV keys to aggregate")]
     pub keys : Vec<String>,
 
-    #[clap(short, long, help = "Tokenise lines (used for non JSON input)")]
-    pub tokenise:  bool,
+    #[clap(short, long, help = "Tokenize lines (used for non JSON input)")]
+    pub tokenize:  bool,
 
     #[clap(short, long, help = "Filter buckets by regular expression")]
     pub filter: Option<regex::Regex>,

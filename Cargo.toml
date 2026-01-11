@@ -1,7 +1,17 @@
 [package]
 name = "aggrs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+authors = ["Nicola Bonelli <nicola.bonelli@larthia.com>"]
+description = "A fast command-line tool for building aggregation trees from JSON and CSV data"
+license = "MIT"
+repository = "https://github.com/awgn/aggrs"
+homepage = "https://github.com/awgn/aggrs"
+documentation = "https://github.com/awgn/aggrs#readme"
+readme = "README.md"
+keywords = ["aggregation", "json", "csv", "cli", "data-analysis"]
+categories = ["command-line-utilities", "data-structures", "parsing"]
+exclude = ["tests/*", "target/*", "*.pcap", "test.json", "test.csv", "diff_test"]
 
 [dependencies]
 anyhow = "1.0.100"
