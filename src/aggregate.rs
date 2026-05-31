@@ -1,21 +1,29 @@
 use anyhow::Result;
 use csv::{ReaderBuilder, StringRecord};
+use hashbrown::hash_map::RawEntryMut;
+use std::ffi::OsStr;
+use std::io::BufRead;
 use std::path::PathBuf;
-use std::{collections::HashMap, io::BufRead};
-
-use serde_json::{to_string, Value};
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::merge::Merge;
+use crate::merge::{AHashMap, Merge};
 use crate::options::Options;
+use crate::smolvalue::SmolValue;
 use crate::visitors::SelectiveVisitor;
+use ahash::RandomState;
 use rayon::prelude::*;
 use scopeguard::defer;
+use smol_str::SmolStr;
+
+// Buffer reused across filter calls to avoid repeated allocations.
+thread_local! {
+    static FILTER_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
 
 #[derive(Debug, Default, Clone)]
-struct AggregateMap(HashMap<Value, AggregateData>);
+struct AggregateMap(AHashMap<SmolValue, AggregateData>);
 
 #[derive(Debug, Default, Clone)]
 struct AggregateData {
@@ -23,22 +31,23 @@ struct AggregateData {
     buckets: Option<Box<AggregateMap>>,
 }
 
-
 impl Merge for AggregateMap {
     fn merge(&mut self, other: &Self) {
         for (key, other_data) in &other.0 {
-            let entry = self.0.entry(key.clone()).or_insert_with(|| AggregateData {
-                count: 0,
-                buckets: Some(Box::new(AggregateMap::new())),
-            });
-
-            entry.count += other_data.count;
-
-            if let Some(other_buckets) = &other_data.buckets {
-                if let Some(entry_buckets) = &mut entry.buckets {
-                    entry_buckets.merge(other_buckets.as_ref());
-                } else {
-                    entry.buckets = Some(other_buckets.clone());
+            match self.0.raw_entry_mut().from_key(key) {
+                RawEntryMut::Occupied(mut entry) => {
+                    let entry = entry.get_mut();
+                    entry.count += other_data.count;
+                    if let Some(other_buckets) = &other_data.buckets {
+                        if let Some(entry_buckets) = &mut entry.buckets {
+                            entry_buckets.merge(other_buckets.as_ref());
+                        } else {
+                            entry.buckets = Some(other_buckets.clone());
+                        }
+                    }
+                }
+                RawEntryMut::Vacant(entry) => {
+                    entry.insert(key.clone(), other_data.clone());
                 }
             }
         }
@@ -47,10 +56,10 @@ impl Merge for AggregateMap {
 
 impl AggregateMap {
     fn new() -> Self {
-        Self(HashMap::new())
+        Self(AHashMap::with_hasher(RandomState::new()))
     }
 
-    fn insert(&mut self, values: Vec<Value>) {
+    fn insert(&mut self, values: Vec<SmolValue>) {
         let mut map = Some(self);
         for value in values {
             let Some(m) = map else {
@@ -115,16 +124,20 @@ impl AggregateMap {
 
         let visitor = Aggregate::new(opt)?;
 
-        let v = match &opt.file {
-            Some(file) => {
-                std::io::BufReader::new(std::fs::File::open(file)?)
-                .lines()
-                .collect::<Result<Vec<_>, _>>()?
-            },
-            None => {
-                std::io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()?
+        // Leak the entire input buffer so that SmolStr::new_static can
+        // store zero-copy references in visit_borrowed_str.
+        let v: &'static [String] = Box::leak(
+            match &opt.file {
+                Some(file) => std::io::BufReader::new(std::fs::File::open(file)?)
+                    .lines()
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => std::io::stdin()
+                    .lock()
+                    .lines()
+                    .collect::<Result<Vec<_>, _>>()?,
             }
-        };
+            .into_boxed_slice(),
+        );
 
         let mut iter = v.iter();
 
@@ -143,14 +156,19 @@ impl AggregateMap {
                 let values = visitor.parse_values(line).unwrap();
 
                 if let Some(filter) = &opt.filter {
-                    if !filter.is_match(
-                        &values
-                            .iter()
-                            .map(to_string)
-                            .collect::<Result<Vec<_>, _>>()
-                            .unwrap()
-                            .join(" "),
-                    ) {
+                    let matched = FILTER_BUF.with(|buf| {
+                        let mut buf = buf.borrow_mut();
+                        buf.clear();
+                        for (i, v) in values.iter().enumerate() {
+                            if i > 0 {
+                                buf.push(' ');
+                            }
+                            use std::fmt::Write;
+                            write!(buf, "{}", v).unwrap();
+                        }
+                        filter.is_match(&buf)
+                    });
+                    if !matched {
                         return amap;
                     }
                 }
@@ -195,14 +213,9 @@ impl Aggregate {
         } else {
             // try deduce format from file extension
             if let Some(file) = &opt.file {
-                let filename = file.display().to_string();
-                let ext = filename
-                    .split('.')
-                    .last()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid file format"))?;
-
-                match ext {
-                    "csv" => ParserType::Csv,
+                let ext = file.extension();
+                match ext.and_then(OsStr::to_str) {
+                    Some("csv") => ParserType::Csv,
                     _ => ParserType::Json, // default to json
                 }
             } else {
@@ -214,8 +227,8 @@ impl Aggregate {
             ParserType::Json => Ok(Aggregate::Json(SelectiveVisitor::new(opt.keys.clone()))),
             ParserType::Csv => {
                 let record = Self::get_string_record(
-                    &opt.file
-                        .clone()
+                    opt.file
+                        .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("file name not specified"))?,
                 )?;
 
@@ -249,9 +262,9 @@ impl Aggregate {
     }
 
     #[inline]
-    fn parse_values(&self, line: &str) -> Result<Vec<Value>> {
+    fn parse_values(&self, line: &str) -> Result<Vec<SmolValue>> {
         match self {
-            Aggregate::Json(visitor) => Ok(visitor.clone().get_values_by_keys(line)?),
+            Aggregate::Json(visitor) => Ok(visitor.get_values_by_keys(line)?),
             Aggregate::Csv(pos) => {
                 let mut rdr = ReaderBuilder::new()
                     .has_headers(false)
@@ -265,7 +278,10 @@ impl Aggregate {
                     .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))??;
 
                 for p in pos {
-                    res.push(Value::String(record.get(*p).unwrap().to_string()));
+                    // SAFETY: the input buffer is leaked as &'static, so
+                    // all &str slices are effectively 'static.
+                    let s: &'static str = unsafe { std::mem::transmute(record.get(*p).unwrap()) };
+                    res.push(SmolValue::String(SmolStr::new_static(s)));
                 }
 
                 Ok(res)
@@ -274,10 +290,16 @@ impl Aggregate {
                 if *tok {
                     Ok(line
                         .split_whitespace()
-                        .map(|s| Value::String(s.to_string()))
+                        .map(|s| {
+                            // SAFETY: input buffer is &'static
+                            let s: &'static str = unsafe { std::mem::transmute(s) };
+                            SmolValue::String(SmolStr::new_static(s))
+                        })
                         .collect())
                 } else {
-                    Ok(vec![Value::String(line.to_string().clone())])
+                    // SAFETY: input buffer is &'static
+                    let s: &'static str = unsafe { std::mem::transmute(line) };
+                    Ok(vec![SmolValue::String(SmolStr::new_static(s))])
                 }
             }
         }

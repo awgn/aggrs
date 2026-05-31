@@ -1,8 +1,9 @@
-mod options;
 mod aggregate;
 mod discovery;
-mod visitors;
 mod merge;
+mod options;
+mod smolvalue;
+mod visitors;
 
 use anyhow::Result;
 use clap::Parser;
@@ -12,11 +13,7 @@ extern crate scopeguard;
 fn main() -> Result<()> {
     let opt = Options::parse();
     match opt.discovery {
-        Some(_) => {
-            discovery::run(opt)
-        }
-        None => {
-            aggregate::run(opt)
-        }
+        Some(_) => discovery::run(opt),
+        None => aggregate::run(opt),
     }
 }

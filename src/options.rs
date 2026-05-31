@@ -1,6 +1,6 @@
-use std::path::PathBuf;
-use colored::Colorize;
 use clap::Parser;
+use colored::Colorize;
+use std::path::PathBuf;
 
 #[derive(Parser, Default, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -15,15 +15,19 @@ pub struct Options {
     pub counters_to_right: bool,
 
     #[clap(short, long, help = "Specify the JSON/CSV keys to aggregate")]
-    pub keys : Vec<String>,
+    pub keys: Vec<String>,
 
     #[clap(short, long, help = "Tokenize lines (used for non JSON input)")]
-    pub tokenize:  bool,
+    pub tokenize: bool,
 
     #[clap(short, long, help = "Filter buckets by regular expression")]
     pub filter: Option<regex::Regex>,
 
-    #[clap(short, long, help = "Discovery keys matching regular expression on values")]
+    #[clap(
+        short,
+        long,
+        help = "Discovery keys matching regular expression on values"
+    )]
     pub discovery: Option<regex::Regex>,
 
     #[clap(short = 'j', long, help = "Specify the number of threads")]

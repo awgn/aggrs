@@ -1,0 +1,4 @@
+[build]
+# Compile for the native CPU to enable SIMD optimizations
+# (e.g. AES for ahash, AVX2/SSE4.2 for memchr in regex/serde_json).
+rustflags = ["-C", "target-cpu=native"]

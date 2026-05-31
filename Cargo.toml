@@ -1,6 +1,6 @@
 [package]
 name = "aggrs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Nicola Bonelli <nicola.bonelli@larthia.com>"]
 description = "A fast command-line tool for building aggregation trees from JSON and CSV data"
@@ -14,18 +14,23 @@ categories = ["command-line-utilities", "data-structures", "parsing"]
 exclude = ["tests/*", "target/*", "*.pcap", "test.json", "test.csv", "diff_test"]
 
 [dependencies]
-anyhow = "1.0.100"
-clap = { version = "4.5.54", features = ["derive"] }
-colored = "3.0.0"
+anyhow = "1.0.102"
+ahash = "0.8"
+hashbrown = "0.15"
+clap = { version = "4.6.1", features = ["derive"] }
+colored = "3.1.1"
 csv = "1.4.0"
-rayon = "1.11.0"
-regex = "1.12.2"
+rayon = "1.12.0"
+regex = "1.12.3"
 scopeguard = "1.2.0"
-serde = "1.0.228"
-serde_json = "1.0.149"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+smol_str = { version = "0.3.6", features = ["serde"] }
 
 [profile.release]
-lto = "thin"
+lto = true
 codegen-units = 1
 opt-level = 3
 debug = false
+panic = "abort"
+strip = "symbols"

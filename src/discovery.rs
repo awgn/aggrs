@@ -1,13 +1,16 @@
-use std::{collections::HashMap, io::BufRead};
+use hashbrown::hash_map::RawEntryMut;
+use std::io::BufRead;
 
+use crate::merge::AHashMap;
+use ahash::RandomState;
+
+use crate::smolvalue::SmolValue;
 use crate::{options::Options, visitors::RegexVisitor};
-use crate::merge::*;
 
-use rayon::iter::ParallelBridge;
-use serde_json::Value;
 use anyhow::Result;
+use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
-use std::io::Write;
+use std::io::{self, Write};
 
 #[derive(Debug, Clone)]
 enum Discovery {
@@ -16,38 +19,52 @@ enum Discovery {
 
 impl Discovery {
     pub fn new(opt: &Options) -> Result<Self> {
-        if let Some(expr)  = &opt.discovery {
+        if let Some(expr) = &opt.discovery {
             Ok(Discovery::Json(RegexVisitor::new(expr.clone())))
         } else {
-            Err(anyhow::anyhow!("Invalid options (learn expression not specified)"))
+            Err(anyhow::anyhow!(
+                "Invalid options (learn expression not specified)"
+            ))
         }
     }
 
     #[inline]
-    pub fn parse_key_value(&self, line: &str) -> Result<Vec<(String, Value)>> {
+    pub fn parse_key_value(&self, line: &str) -> Result<Vec<(String, SmolValue)>> {
         match self {
-            Discovery::Json(learn) =>  Ok(learn.clone().get_keys_by_regex(line)?),
+            Discovery::Json(learn) => Ok(learn.get_keys_by_regex(line)?),
         }
     }
-
 }
 
 #[derive(Debug, Default)]
-struct DiscoveryMap(HashMap<String, HashMap<Value, u64>>);
-
-impl Merge for DiscoveryMap {
-    fn merge(&mut self, other: &Self) {
-        for (key, other_values) in &other.0 {
-            let entry = self.0.entry(key.clone()).or_default();
-            entry.merge(other_values);
-        }
-    }
-}
-
+struct DiscoveryMap(AHashMap<String, AHashMap<SmolValue, u64>>);
 
 impl DiscoveryMap {
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self(AHashMap::with_hasher(RandomState::new()))
+    }
+
+    fn merge_into(&mut self, other: &Self) {
+        for (key, other_values) in &other.0 {
+            match self.0.raw_entry_mut().from_key(key) {
+                RawEntryMut::Occupied(mut entry) => {
+                    let inner = entry.get_mut();
+                    for (v, cnt) in other_values {
+                        match inner.raw_entry_mut().from_key(v) {
+                            RawEntryMut::Occupied(mut e) => {
+                                *e.get_mut() += *cnt;
+                            }
+                            RawEntryMut::Vacant(e) => {
+                                e.insert(v.clone(), *cnt);
+                            }
+                        }
+                    }
+                }
+                RawEntryMut::Vacant(entry) => {
+                    entry.insert(key.clone(), other_values.clone());
+                }
+            }
+        }
     }
 
     pub fn print(&self, opt: &Options) {
@@ -76,16 +93,17 @@ impl DiscoveryMap {
     pub fn discovery(self, opt: &Options) -> Result<DiscoveryMap> {
         let discovery = Discovery::new(opt)?;
 
-        let v = match &opt.file {
-            Some(file) => {
-                std::io::BufReader::new(std::fs::File::open(file)?)
-                .lines()
-                .collect::<Result<Vec<_>, _>>()?
-            },
-            None => {
-                std::io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()?
+        // Leak the entire input buffer so that SmolStr::new_static can
+        // store zero-copy references in visit_borrowed_str.
+        let v: &'static [String] = Box::leak(
+            match &opt.file {
+                Some(file) => io::BufReader::new(std::fs::File::open(file)?)
+                    .lines()
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()?,
             }
-        };
+            .into_boxed_slice(),
+        );
 
         let iter = v.iter();
 
@@ -99,11 +117,10 @@ impl DiscoveryMap {
                 let values = discovery.parse_key_value(line).unwrap();
                 let filter = opt.discovery.as_ref().unwrap();
 
-                let res = values.into_iter().filter(|(_, value)| {
-                        filter.is_match(&value.to_string())
-                }).collect::<Vec<(String,Value)>>();
-
-                // insert the key values into the map, if the key is not present, create a new HashSet.
+                let res = values
+                    .into_iter()
+                    .filter(|(_, value)| filter.is_match(&value.to_string()))
+                    .collect::<Vec<(String, SmolValue)>>();
 
                 for (key, value) in res {
                     let key_entry = dmap.0.entry(key).or_default();
@@ -114,7 +131,7 @@ impl DiscoveryMap {
                 dmap
             })
             .reduce(DiscoveryMap::default, |mut dmap, b| {
-                dmap.merge(&b);
+                dmap.merge_into(&b);
                 dmap
             });
 
