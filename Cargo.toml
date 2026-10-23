@@ -1,6 +1,6 @@
 [package]
 name = "aggrs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Nicola Bonelli <nicola.bonelli@larthia.com>"]
 description = "A fast command-line tool for building aggregation trees from JSON and CSV data"
