@@ -202,28 +202,7 @@ enum Aggregate {
 
 impl Aggregate {
     fn new(opt: &Options) -> Result<Self> {
-        let par_type = if opt.keys.is_empty() {
-            ParserType::Text
-        } else if let Some(format) = &opt.file_format {
-            match format.as_str() {
-                "json" => ParserType::Json,
-                "csv" => ParserType::Csv,
-                _ => return Err(anyhow::anyhow!("Invalid file format")),
-            }
-        } else {
-            // try deduce format from file extension
-            if let Some(file) = &opt.file {
-                let ext = file.extension();
-                match ext.and_then(OsStr::to_str) {
-                    Some("csv") => ParserType::Csv,
-                    _ => ParserType::Json, // default to json
-                }
-            } else {
-                ParserType::Json
-            }
-        };
-
-        match par_type {
+        match Self::get_parse_type(opt)? {
             ParserType::Json => Ok(Aggregate::Json(SelectiveVisitor::new(opt.keys.clone()))),
             ParserType::Csv => {
                 let record = Self::get_string_record(
@@ -246,6 +225,31 @@ impl Aggregate {
                 Ok(Aggregate::Csv(pos))
             }
             ParserType::Text => Ok(Aggregate::Text(opt.tokenize)),
+        }
+    }
+
+    fn get_parse_type(opt: &Options) -> Result<ParserType> {
+        if opt.keys.is_empty() {
+            return Ok(ParserType::Text)
+        }
+
+        if let Some(format) = &opt.file_format {
+            match format.as_str() {
+                "json" => Ok(ParserType::Json),
+                "csv" => Ok(ParserType::Csv),
+                _ => Err(anyhow::anyhow!("Invalid file format")),
+            }
+        } else {
+            // try deduce format from file extension
+            if let Some(file) = &opt.file {
+                let ext = file.extension();
+                match ext.and_then(OsStr::to_str) {
+                    Some("csv") => Ok(ParserType::Csv),
+                    _ => Ok(ParserType::Json), // default to json
+                }
+            } else {
+                Ok(ParserType::Json)
+            }
         }
     }
 
