@@ -87,30 +87,35 @@ impl AggregateMap {
 
         let mut stdout = std::io::stdout();
         for (k, v) in pairs {
-            write!(stdout, "{}", " ".repeat(level as usize)).unwrap();
-            if opt.counters_to_right {
-                write!(stdout, "{} -> {}", opt.colorize(&k.to_string()), v.count).unwrap();
-                if opt.verbose {
-                    writeln!(
-                        stdout,
-                        " ({:.2}%)",
-                        (v.count as f64 / total_count as f64) * 100.0
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(stdout).unwrap();
-                }
+            if opt.raw {
+                // Raw mode: print only the value, no counters, no indentation.
+                writeln!(stdout, "{}", k).unwrap();
             } else {
-                write!(stdout, "{}", v.count).unwrap();
-                if opt.verbose {
-                    write!(
-                        stdout,
-                        " ({:.2}%)",
-                        (v.count as f64 / total_count as f64) * 100.0
-                    )
-                    .unwrap();
+                write!(stdout, "{}", " ".repeat(level as usize)).unwrap();
+                if opt.counters_to_right {
+                    write!(stdout, "{} -> {}", opt.colorize(&k.to_string()), v.count).unwrap();
+                    if opt.verbose {
+                        writeln!(
+                            stdout,
+                            " ({:.2}%)",
+                            (v.count as f64 / total_count as f64) * 100.0
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(stdout).unwrap();
+                    }
+                } else {
+                    write!(stdout, "{}", v.count).unwrap();
+                    if opt.verbose {
+                        write!(
+                            stdout,
+                            " ({:.2}%)",
+                            (v.count as f64 / total_count as f64) * 100.0
+                        )
+                        .unwrap();
+                    }
+                    writeln!(stdout, ": {}", opt.colorize(&k.to_string())).unwrap();
                 }
-                writeln!(stdout, ": {}", opt.colorize(&k.to_string())).unwrap();
             }
 
             if let Some(buckets) = &v.buckets {

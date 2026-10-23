@@ -39,6 +39,9 @@ pub struct Options {
     #[clap(short, long, help = "Enable verbose mode")]
     pub verbose: bool,
 
+    #[clap(long, help = "Print only values without counters (useful for piping to jq)")]
+    pub raw: bool,
+
     pub file: Option<PathBuf>,
 }
 
