@@ -4,13 +4,14 @@ A fast, multi-threaded command-line tool for building hierarchical aggregation t
 
 ## Features
 
-- 🚀 **Fast & Parallel**: Built with Rust and Rayon for multi-threaded processing
-- 📊 **Hierarchical Aggregation**: Build nested aggregation trees with multiple keys
+- 🚀 **Fast & Parallel**: Built with Rust, Rayon, zero-copy string slicing, and streaming selective JSON extraction for multi-gigabyte/s throughput
+- 📊 **Hierarchical Aggregation**: Build nested aggregation trees with multiple flat or dotted keys (e.g. `-k info.dns.server`)
 - 🔍 **Key Discovery**: Find which keys contain specific values in your data
 - 📁 **Multiple Formats**: Supports JSON (newline-delimited), CSV, and plain text
 - 🎨 **Colored Output**: Optional colored output for better readability
 - 🔎 **Filtering**: Filter results using regular expressions
 - 📈 **Statistics**: Optional percentage display for each bucket
+- 🧩 **Raw Output**: Print only aggregated values without counters (`--raw`) for easy piping to tools like `jq`
 
 ## Installation
 
@@ -42,11 +43,12 @@ If no file is specified, `aggrs` reads from stdin.
 
 | Option | Description |
 |--------|-------------|
-| `-k, --keys <KEYS>` | Specify the JSON/CSV keys to aggregate (can be repeated) |
+| `-k, --keys <KEYS>` | Specify the JSON/CSV keys to aggregate (can be repeated, supports nested paths like `a.b.c`) |
 | `-l, --level <LEVEL>` | Specify the aggregation level depth |
 | `-c, --colors` | Enable colored output |
 | `-v, --verbose` | Enable verbose mode (shows percentages) |
 | `--counters-to-right` | Display counters to the right of bucket names |
+| `--raw` | Print only values without counters (useful for piping to `jq`) |
 | `-t, --tokenize` | Tokenize lines by whitespace (for plain text input) |
 | `-f, --filter <FILTER>` | Filter buckets by regular expression |
 | `-d, --discovery <DISCOVERY>` | Discover keys matching regex on values |
@@ -75,17 +77,23 @@ aggrs -k transport -k application -k service flows.json
 
 Output:
 ```
-1: "udp"
-    1: "dns"
-        1: "cloudflare"
-2: "tcp"
-    1: "http"
-        1: "google"
-    1: "https"
-        1: "facebook"
+1: udp
+    1: dns
+        1: cloudflare
+2: tcp
+    1: http
+        1: google
+    1: https
+        1: facebook
 buckets      : 2
 total entries: 3
 time elapsed : 0.42ms
+```
+
+**Aggregate nested JSON objects and sub-keys:**
+
+```bash
+aggrs -k info.dns.server -k info.dns.client flows.json
 ```
 
 **With colored output and percentages:**
@@ -96,11 +104,11 @@ aggrs -k transport -k application flows.json -c -v
 
 Output:
 ```
-1 (33.33%): "udp"
-    1 (100.00%): "dns"
-2 (66.67%): "tcp"
-    1 (50.00%): "http"
-    1 (50.00%): "https"
+1 (33.33%): udp
+    1 (100.00%): dns
+2 (66.67%): tcp
+    1 (50.00%): http
+    1 (50.00%): https
 ```
 
 **Display counters to the right:**
@@ -111,11 +119,11 @@ aggrs -k transport -k application flows.json --counters-to-right -v
 
 Output:
 ```
-"udp" -> 1 (33.33%)
-    "dns" -> 1 (100.00%)
-"tcp" -> 2 (66.67%)
-    "http" -> 1 (50.00%)
-    "https" -> 1 (50.00%)
+udp -> 1 (33.33%)
+    dns -> 1 (100.00%)
+tcp -> 2 (66.67%)
+    http -> 1 (50.00%)
+    https -> 1 (50.00%)
 ```
 
 ### CSV Aggregation
@@ -138,14 +146,14 @@ aggrs -k category -k application traffic.csv
 
 Output:
 ```
-1: "development"
-    1: "ssh"
-1: "infrastructure"
-    1: "dns"
-1: "search"
-    1: "http"
-1: "social"
-    1: "https"
+1: development
+    1: ssh
+1: infrastructure
+    1: dns
+1: search
+    1: http
+1: social
+    1: https
 ```
 
 ### Key Discovery
@@ -228,12 +236,12 @@ At the end, `aggrs` displays:
 - All other files are treated as JSON (newline-delimited)
 - Use `--file-format` to override automatic detection
 
-## Performance Tips
+## Performance Architecture
 
-1. **Use multiple threads** (`-j`) for large files
-2. **Specify only needed keys** to reduce memory usage
-3. **Use filters** (`-f`) to reduce the dataset early
-4. The tool processes files in parallel using Rayon for optimal performance
+- **Contiguous Zero-Copy Input**: Reads input into a single contiguous buffer and partitions lines across Rayon worker chunks using SIMD `memchr`, avoiding per-line heap allocations and channel contention.
+- **Streaming Multi-Branch JSON Extraction**: Navigates nested JSON key paths (`a.b.c`) directly in the `serde` visitor, skipping unrelated sibling objects and fields via `IgnoredAny` without allocating intermediate maps.
+- **Compact Value Representation**: Uses zero-copy static `SmolStr` slices and flat sorted `Vec<(SmolStr, SmolValue)>` objects with `ahash` and `hashbrown` for low-overhead hashing and move-based parallel tree reduction.
+- **Buffered Direct Output**: Formats numbers and values directly into a 256 KB `BufWriter` using `itoa` and `zmij`.
 
 ## Use Cases
 

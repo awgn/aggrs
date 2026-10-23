@@ -1,5 +1,5 @@
 use hashbrown::hash_map::RawEntryMut;
-use std::io::BufRead;
+use std::io::{BufWriter, Read, Write};
 
 use crate::merge::AHashMap;
 use ahash::RandomState;
@@ -8,9 +8,7 @@ use crate::smolvalue::SmolValue;
 use crate::{options::Options, visitors::RegexVisitor};
 
 use anyhow::Result;
-use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
-use std::io::{self, Write};
 
 #[derive(Debug, Clone)]
 enum Discovery {
@@ -44,95 +42,131 @@ impl DiscoveryMap {
         Self(AHashMap::with_hasher(RandomState::new()))
     }
 
-    fn merge_into(&mut self, other: &Self) {
-        for (key, other_values) in &other.0 {
-            match self.0.raw_entry_mut().from_key(key) {
+    fn merge_owned(&mut self, mut other: Self) {
+        if self.0.is_empty() {
+            *self = other;
+            return;
+        }
+        if other.0.len() > self.0.len() {
+            std::mem::swap(self, &mut other);
+        }
+        self.0.reserve(other.0.len());
+        for (key, other_values) in other.0 {
+            match self.0.raw_entry_mut().from_key(&key) {
                 RawEntryMut::Occupied(mut entry) => {
                     let inner = entry.get_mut();
+                    inner.reserve(other_values.len());
                     for (v, cnt) in other_values {
-                        match inner.raw_entry_mut().from_key(v) {
+                        match inner.raw_entry_mut().from_key(&v) {
                             RawEntryMut::Occupied(mut e) => {
-                                *e.get_mut() += *cnt;
+                                *e.get_mut() += cnt;
                             }
                             RawEntryMut::Vacant(e) => {
-                                e.insert(v.clone(), *cnt);
+                                e.insert(v, cnt);
                             }
                         }
                     }
                 }
                 RawEntryMut::Vacant(entry) => {
-                    entry.insert(key.clone(), other_values.clone());
+                    entry.insert(key, other_values);
                 }
             }
         }
     }
 
-    pub fn print(&self, opt: &Options) {
+    pub fn print(&self, opt: &Options) -> std::io::Result<()> {
         let mut pairs = Vec::with_capacity(self.0.len());
 
         for (key, values) in &self.0 {
             pairs.push((key, values));
         }
 
-        pairs.sort_by(|a, b| a.1.len().cmp(&b.1.len()));
+        pairs.sort_unstable_by_key(|a| a.1.len());
 
-        let mut stdout = std::io::stdout();
+        let stdout = std::io::stdout();
+        let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
+        let mut itoa_buf = itoa::Buffer::new();
+
         for (k, v) in pairs {
             let total = v.values().sum::<u64>();
 
-            writeln!(stdout, "{}: {}", opt.colorize(k), total).unwrap();
+            writeln!(out, "{}: {}", opt.colorize(k), itoa_buf.format(total))?;
 
             if opt.verbose {
                 for (value, cnt) in v {
-                    writeln!(stdout, "    {} -> {}", value, cnt).unwrap();
+                    out.write_all(b"    ")?;
+                    value.write_to(&mut out)?;
+                    out.write_all(b" -> ")?;
+                    out.write_all(itoa_buf.format(*cnt).as_bytes())?;
+                    out.write_all(b"\n")?;
                 }
             }
         }
+        out.flush()
     }
 
     pub fn discovery(self, opt: &Options) -> Result<DiscoveryMap> {
         let discovery = Discovery::new(opt)?;
 
-        // Leak the entire input buffer so that SmolStr::new_static can
+        // Leak a single contiguous input buffer so that SmolStr::new_static can
         // store zero-copy references in visit_borrowed_str.
-        let v: &'static [String] = Box::leak(
+        let content: &'static str = Box::leak(
             match &opt.file {
-                Some(file) => io::BufReader::new(std::fs::File::open(file)?)
-                    .lines()
-                    .collect::<Result<Vec<_>, _>>()?,
-                None => io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()?,
+                Some(file) => std::fs::read_to_string(file)?,
+                None => {
+                    let mut s = String::new();
+                    std::io::stdin().lock().read_to_string(&mut s)?;
+                    s
+                }
             }
-            .into_boxed_slice(),
+            .into_boxed_str(),
         );
 
-        let iter = v.iter();
+        let slice = content.as_bytes();
+        let num_threads = rayon::current_num_threads();
+        let target_chunks = (num_threads * 4).max(1);
+        let chunk_size = (slice.len() / target_chunks).max(64 * 1024);
 
-        let map = iter
-            .par_bridge()
-            .fold(DiscoveryMap::default, |mut dmap, line| {
-                if line.starts_with('#') {
-                    return dmap;
+        let mut chunks: Vec<&'static str> = Vec::with_capacity(target_chunks + 1);
+        let mut pos = 0;
+        while pos < slice.len() {
+            let end = if pos + chunk_size >= slice.len() {
+                slice.len()
+            } else {
+                match memchr::memchr(b'\n', &slice[pos + chunk_size..]) {
+                    Some(nl) => pos + chunk_size + nl + 1,
+                    None => slice.len(),
                 }
+            };
+            let chunk_str = unsafe { std::str::from_utf8_unchecked(&slice[pos..end]) };
+            chunks.push(chunk_str);
+            pos = end;
+        }
 
-                let values = discovery.parse_key_value(line).unwrap();
-                let filter = opt.discovery.as_ref().unwrap();
+        let map = chunks
+            .into_par_iter()
+            .map(|chunk| {
+                let mut dmap = DiscoveryMap::new();
+                for mut line in chunk.split('\n') {
+                    if line.ends_with('\r') {
+                        line = &line[..line.len() - 1];
+                    }
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
 
-                let res = values
-                    .into_iter()
-                    .filter(|(_, value)| filter.is_match(&value.to_string()))
-                    .collect::<Vec<(String, SmolValue)>>();
-
-                for (key, value) in res {
-                    let key_entry = dmap.0.entry(key).or_default();
-                    let value_entry = key_entry.entry(value).or_default();
-                    *value_entry += 1;
+                    let values = discovery.parse_key_value(line).unwrap();
+                    for (key, value) in values {
+                        let key_entry = dmap.0.entry(key).or_default();
+                        let value_entry = key_entry.entry(value).or_default();
+                        *value_entry += 1;
+                    }
                 }
-
                 dmap
             })
-            .reduce(DiscoveryMap::default, |mut dmap, b| {
-                dmap.merge_into(&b);
-                dmap
+            .reduce(DiscoveryMap::new, |mut dmap_a, dmap_b| {
+                dmap_a.merge_owned(dmap_b);
+                dmap_a
             });
 
         Ok(map)
@@ -150,7 +184,7 @@ pub fn run(opt: Options) -> Result<()> {
     let dmap = DiscoveryMap::new().discovery(&opt)?;
     let elapsed = start.elapsed();
 
-    dmap.print(&opt);
+    dmap.print(&opt)?;
 
     println!("buckets      : {}", dmap.0.len());
     println!("time elapsed : {:.2?}", elapsed);
