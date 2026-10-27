@@ -397,6 +397,106 @@ impl SmolValue {
             }
         }
     }
+
+    /// Writes value in `--raw` mode: top-level strings are unquoted, while JSON arrays
+    /// and objects are emitted as valid JSON (with quoted and escaped keys/strings).
+    #[inline]
+    pub fn write_raw_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        match self {
+            SmolValue::Array(_) | SmolValue::Object(_) => self.write_json_to(w),
+            _ => self.write_to(w),
+        }
+    }
+
+    /// Writes value as valid RFC 8259 JSON.
+    #[inline]
+    pub fn write_json_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        match self {
+            SmolValue::Null => w.write_all(b"null"),
+            SmolValue::Bool(true) => w.write_all(b"true"),
+            SmolValue::Bool(false) => w.write_all(b"false"),
+            SmolValue::Number(n) => {
+                let v = n.0;
+                if v.fract() == 0.0
+                    && v.abs() < 9_007_199_254_740_992.0
+                    && (v != 0.0 || !v.is_sign_negative())
+                {
+                    let mut buf = itoa::Buffer::new();
+                    w.write_all(buf.format(v as i64).as_bytes())
+                } else {
+                    write!(w, "{}", v)
+                }
+            }
+            SmolValue::String(s) => write_json_str_to(w, s.as_str()),
+            SmolValue::Array(arr) => {
+                w.write_all(b"[")?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        w.write_all(b",")?;
+                    }
+                    v.write_json_to(w)?;
+                }
+                w.write_all(b"]")
+            }
+            SmolValue::Object(map) => {
+                w.write_all(b"{")?;
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        w.write_all(b",")?;
+                    }
+                    write_json_str_to(w, k.as_str())?;
+                    w.write_all(b":")?;
+                    v.write_json_to(w)?;
+                }
+                w.write_all(b"}")
+            }
+        }
+    }
+}
+
+#[inline]
+fn write_json_str_to<W: std::io::Write>(w: &mut W, s: &str) -> std::io::Result<()> {
+    w.write_all(b"\"")?;
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            if start < i {
+                w.write_all(&bytes[start..i])?;
+            }
+            match b {
+                b'"' => w.write_all(b"\\\"")?,
+                b'\\' => w.write_all(b"\\\\")?,
+                b'\x08' => w.write_all(b"\\b")?,
+                b'\x0c' => w.write_all(b"\\f")?,
+                b'\n' => w.write_all(b"\\n")?,
+                b'\r' => w.write_all(b"\\r")?,
+                b'\t' => w.write_all(b"\\t")?,
+                _ => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    let esc = [
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX[(b >> 4) as usize],
+                        HEX[(b & 0x0f) as usize],
+                    ];
+                    w.write_all(&esc)?;
+                }
+            }
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        w.write_all(&bytes[start..])?;
+    }
+    w.write_all(b"\"")
+}
+
+#[inline]
+fn write_json_str_vec(buf: &mut Vec<u8>, s: &str) {
+    let _ = write_json_str_to(buf, s);
 }
 
 impl fmt::Display for SmolValue {
@@ -478,13 +578,14 @@ pub fn scan_json_string(bytes: &[u8], mut i: usize) -> Option<(usize, bool)> {
 }
 
 /// If `raw` can be represented as a zero-copy slice of `raw` without allocation, returns `Some(slice)`.
-/// Otherwise appends the canonical `SmolValue` display representation into `buf` (using `tmp` as scratch)
-/// and returns `None`.
+/// Otherwise appends the canonical `SmolValue` representation into `buf` (using `tmp` as scratch)
+/// and returns `None`. When `raw_mode` is true, JSON arrays and objects are formatted as valid JSON.
 #[inline]
 pub fn format_or_borrow_canonical<'a>(
     raw: &'a [u8],
     buf: &mut Vec<u8>,
     tmp: &mut Vec<u8>,
+    raw_mode: bool,
 ) -> Option<&'a [u8]> {
     if raw.is_empty() || raw == b"null" {
         return Some(b"null");
@@ -495,8 +596,16 @@ pub fn format_or_borrow_canonical<'a>(
         b'f' if raw == b"false" => return Some(b"false"),
         b'"' => {
             if let Some((end, has_escape)) = scan_json_string(raw, 0) {
-                if !has_escape && end == raw.len() {
-                    return Some(&raw[1..raw.len() - 1]);
+                if end == raw.len() {
+                    if !has_escape {
+                        return Some(&raw[1..raw.len() - 1]);
+                    }
+                    if let Ok(s) = serde_json::from_slice::<SmolStr>(raw) {
+                        buf.extend_from_slice(s.as_bytes());
+                    } else {
+                        buf.extend_from_slice(&raw[1..raw.len() - 1]);
+                    }
+                    return None;
                 }
             }
         }
@@ -507,7 +616,7 @@ pub fn format_or_borrow_canonical<'a>(
         }
         _ => {}
     }
-    if format_value_at(raw, 0, buf, tmp).is_none() {
+    if format_value_at(raw, 0, buf, tmp, raw_mode).is_none() {
         buf.extend_from_slice(b"null");
     }
     None
@@ -518,6 +627,7 @@ fn format_value_at(
     pos: usize,
     buf: &mut Vec<u8>,
     tmp: &mut Vec<u8>,
+    raw_mode: bool,
 ) -> Option<usize> {
     let i = skip_ws(bytes, pos);
     if i >= bytes.len() {
@@ -538,7 +648,15 @@ fn format_value_at(
         }
         b'"' => {
             let (end, has_escape) = scan_json_string(bytes, i)?;
-            if !has_escape {
+            if raw_mode {
+                if !has_escape {
+                    buf.extend_from_slice(unsafe { bytes.get_unchecked(i..end) });
+                } else if let Ok(s) = serde_json::from_slice::<SmolStr>(&bytes[i..end]) {
+                    write_json_str_vec(buf, s.as_str());
+                } else {
+                    buf.extend_from_slice(unsafe { bytes.get_unchecked(i..end) });
+                }
+            } else if !has_escape {
                 buf.extend_from_slice(unsafe { bytes.get_unchecked(i + 1..end - 1) });
             } else if let Ok(s) = serde_json::from_slice::<SmolStr>(&bytes[i..end]) {
                 buf.extend_from_slice(s.as_bytes());
@@ -560,7 +678,7 @@ fn format_value_at(
                     buf.push(b',');
                 }
                 first = false;
-                cur = format_value_at(bytes, cur, buf, tmp)?;
+                cur = format_value_at(bytes, cur, buf, tmp, raw_mode)?;
                 cur = skip_ws(bytes, cur);
                 if cur >= bytes.len() {
                     return None;
@@ -602,7 +720,7 @@ fn format_value_at(
                 cur += 1;
 
                 let v_start = (buf.len() - obj_out_start) as u32;
-                cur = format_value_at(bytes, cur, buf, tmp)?;
+                cur = format_value_at(bytes, cur, buf, tmp, raw_mode)?;
                 let v_end = (buf.len() - obj_out_start) as u32;
 
                 let entry = (key_raw, v_start, v_end, key_esc);
@@ -657,7 +775,22 @@ fn format_value_at(
                 if idx > 0 {
                     buf.push(b',');
                 }
-                if !key_esc {
+                if raw_mode {
+                    if !key_esc {
+                        buf.push(b'"');
+                        buf.extend_from_slice(key_raw);
+                        buf.push(b'"');
+                    } else if let Ok(s) = serde_json::from_slice::<SmolStr>(
+                        &bytes[key_raw.as_ptr() as usize - bytes.as_ptr() as usize - 1
+                            ..key_raw.as_ptr() as usize - bytes.as_ptr() as usize + key_raw.len() + 1],
+                    ) {
+                        write_json_str_vec(buf, s.as_str());
+                    } else {
+                        buf.push(b'"');
+                        buf.extend_from_slice(key_raw);
+                        buf.push(b'"');
+                    }
+                } else if !key_esc {
                     buf.extend_from_slice(key_raw);
                 } else if let Ok(s) = serde_json::from_slice::<SmolStr>(
                     &bytes[key_raw.as_ptr() as usize - bytes.as_ptr() as usize - 1
@@ -719,5 +852,61 @@ fn format_value_at(
             }
             Some(end)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn canon_str(raw: &[u8], raw_mode: bool) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = Vec::new();
+        if let Some(s) = format_or_borrow_canonical(raw, &mut buf, &mut tmp, raw_mode) {
+            String::from_utf8(s.to_vec()).unwrap()
+        } else {
+            String::from_utf8(buf).unwrap()
+        }
+    }
+
+    #[test]
+    fn raw_mode_json_object_and_array() {
+        let input: &'static str = r#"{"b":"hello","a":["x","y\"z",1,true,null],"empty":""}"#;
+        let val: SmolValue = serde_json::from_str(input).unwrap();
+
+        let mut normal_buf = Vec::new();
+        val.write_to(&mut normal_buf).unwrap();
+        assert_eq!(
+            String::from_utf8(normal_buf).unwrap(),
+            r#"{a:[x,y"z,1,true,null],b:hello,empty:}"#
+        );
+        assert_eq!(
+            canon_str(input.as_bytes(), false),
+            r#"{a:[x,y"z,1,true,null],b:hello,empty:}"#
+        );
+
+        let mut raw_buf = Vec::new();
+        val.write_raw_to(&mut raw_buf).unwrap();
+        let raw_out = String::from_utf8(raw_buf).unwrap();
+        assert_eq!(
+            raw_out,
+            r#"{"a":["x","y\"z",1,true,null],"b":"hello","empty":""}"#
+        );
+        assert_eq!(canon_str(input.as_bytes(), true), raw_out);
+
+        // Verify valid JSON parseable by serde_json
+        let reparsed: serde_json::Value = serde_json::from_str(&raw_out).unwrap();
+        assert_eq!(reparsed["b"], "hello");
+        assert_eq!(reparsed["empty"], "");
+    }
+
+    #[test]
+    fn raw_mode_top_level_primitives() {
+        let s_in: &'static str = r#""192.168.1.1""#;
+        let val: SmolValue = serde_json::from_str(s_in).unwrap();
+        let mut raw_buf = Vec::new();
+        val.write_raw_to(&mut raw_buf).unwrap();
+        assert_eq!(String::from_utf8(raw_buf).unwrap(), "192.168.1.1");
+        assert_eq!(canon_str(s_in.as_bytes(), true), "192.168.1.1");
     }
 }

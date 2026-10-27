@@ -236,7 +236,8 @@ fn run_single_key_json(
 
             for &(_raw_hash, raw, count) in &merged_raw {
                 let start = arena_buf.len();
-                if let Some(borrowed) = format_or_borrow_canonical(raw, &mut arena_buf, &mut tmp_buf)
+                if let Some(borrowed) =
+                    format_or_borrow_canonical(raw, &mut arena_buf, &mut tmp_buf, opt.raw)
                 {
                     formatted_items.push((SliceOrRange::Borrowed(borrowed), count));
                 } else {
@@ -388,8 +389,10 @@ fn run_single_key_json(
         lock.flush()?;
     }
 
-    println!("buckets      : {}", total_buckets);
-    println!("total entries: {}", total_entries);
+    if !opt.raw {
+        println!("buckets      : {}", total_buckets);
+        println!("total entries: {}", total_entries);
+    }
 
     std::mem::forget(worker_results);
     std::mem::forget(raw_shard_outputs);
@@ -471,7 +474,7 @@ impl AggregateMap {
 
         for (k, v) in pairs {
             if opt.raw {
-                k.write_to(out)?;
+                k.write_raw_to(out)?;
                 out.write_all(b"\n")?;
             } else {
                 let mut rem = level;
@@ -724,10 +727,13 @@ pub fn run(opt: Options) -> Result<()> {
             .build_global()?;
     }
 
+    let raw = opt.raw;
     let start = std::time::Instant::now();
     defer! {
-        let elapsed = start.elapsed();
-        println!("time elapsed : {:.2?}", elapsed);
+        if !raw {
+            let elapsed = start.elapsed();
+            println!("time elapsed : {:.2?}", elapsed);
+        }
     }
 
     let visitor = Aggregate::new(&opt)?;
@@ -748,8 +754,10 @@ pub fn run(opt: Options) -> Result<()> {
         out.flush()?;
     }
 
-    println!("buckets      : {}", amap.0.len());
-    println!("total entries: {}", entries);
+    if !raw {
+        println!("buckets      : {}", amap.0.len());
+        println!("total entries: {}", entries);
+    }
 
     std::mem::forget(amap);
 
