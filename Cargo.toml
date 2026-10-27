@@ -11,7 +11,7 @@ documentation = "https://github.com/awgn/aggrs#readme"
 readme = "README.md"
 keywords = ["aggregation", "json", "csv", "cli", "data-analysis"]
 categories = ["command-line-utilities", "data-structures", "parsing"]
-exclude = ["tests/*", "target/*", "*.pcap", "test.json", "test.csv", "diff_test"]
+exclude = ["tests/*", "target/*", "*.pcap", "test.json", "test.csv", "diff_test", "skills/*"]
 
 [dependencies]
 anyhow = "1.0.104"
