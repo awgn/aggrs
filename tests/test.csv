@@ -1,5 +1,21 @@
-name,age,city
-Alice,30,New York
-Bob,25,Los Angeles
-Bob,34,Florence
-Charlie,30,Chicago
+transport,application,service,src_ip,dst_ip,src_port,dst_port,bytes,packets,country,category
+tcp,http,google,192.168.1.100,172.217.14.110,54321,80,15000,120,US,search
+tcp,http,google,192.168.1.101,172.217.14.110,54322,80,12000,95,US,search
+tcp,https,facebook,192.168.1.100,157.240.1.35,54323,443,25000,200,US,social
+tcp,https,facebook,192.168.1.102,157.240.1.35,54324,443,18000,150,US,social
+tcp,https,facebook,192.168.1.103,157.240.1.36,54325,443,22000,180,US,social
+tcp,http,amazon,192.168.1.100,52.94.236.248,54326,80,8000,60,US,shopping
+tcp,https,amazon,192.168.1.101,52.94.236.249,54327,443,35000,280,US,shopping
+udp,dns,cloudflare,192.168.1.100,1.1.1.1,54328,53,500,5,US,infrastructure
+udp,dns,cloudflare,192.168.1.101,1.1.1.1,54329,53,480,4,US,infrastructure
+udp,dns,google-dns,192.168.1.102,8.8.8.8,54330,53,520,6,US,infrastructure
+tcp,https,twitter,192.168.1.100,104.244.42.1,54331,443,14000,110,US,social
+tcp,https,twitter,192.168.1.101,104.244.42.2,54332,443,16000,130,US,social
+tcp,ssh,github,192.168.1.100,140.82.121.4,54333,22,9000,75,US,development
+tcp,ssh,github,192.168.1.102,140.82.121.5,54334,22,11000,90,US,development
+tcp,https,github,192.168.1.100,140.82.121.6,54335,443,45000,350,US,development
+tcp,http,nginx,192.168.1.100,10.0.0.50,54336,80,3000,25,local,webserver
+tcp,http,nginx,192.168.1.101,10.0.0.50,54337,80,4500,38,local,webserver
+tcp,http,apache,192.168.1.102,10.0.0.51,54338,80,5200,42,local,webserver
+udp,ntp,pool-ntp,192.168.1.100,129.6.15.28,54339,123,200,2,US,infrastructure
+udp,ntp,pool-ntp,192.168.1.101,129.6.15.29,54340,123,180,2,US,infrastructure
