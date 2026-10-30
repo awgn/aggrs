@@ -43,13 +43,14 @@ If no file is specified, `aggrs` reads from stdin.
 
 | Option | Description |
 |--------|-------------|
-| `-k, --keys <KEYS>` | Specify the JSON/CSV keys to aggregate (can be repeated, supports nested paths like `a.b.c`) |
+| `-k, --keys <KEYS>` | Specify the JSON/CSV keys to aggregate (can be repeated, supports nested paths like `a.b.c`); in tokenize mode, column numbers starting from 1 |
 | `-l, --level <LEVEL>` | Specify the aggregation level depth |
 | `-c, --colors` | Enable colored output |
 | `-v, --verbose` | Enable verbose mode (shows percentages) |
 | `--counters-to-right` | Display counters to the right of bucket names |
 | `--raw` | Print only values without counters (useful for piping to `jq`) |
 | `-t, --tokenize` | Tokenize lines by whitespace (for plain text input) |
+| `-s, --separator <SEP>` | Tokenize lines using the given separator (implies `-t`, use `\t` for tab) |
 | `-f, --filter <FILTER>` | Filter buckets by regular expression |
 | `-d, --discovery <DISCOVERY>` | Discover keys matching regex on values |
 | `-j, --num-threads <NUM_THREADS>` | Specify the number of threads |
@@ -194,6 +195,22 @@ cat access.log | aggrs -t
 ```
 
 This splits each line by whitespace and treats each token as a separate level.
+
+Use `-k` with column numbers (starting from 1, like `awk`/`cut`) to aggregate only
+some columns, in the given order. Missing columns are reported as `null`:
+
+```bash
+# method -> status code
+aggrs -t -k 6 -k 9 access.log
+```
+
+Use `-s` to split on a custom separator instead of whitespace (it implies `-t`).
+The separator is matched literally and empty fields are preserved:
+
+```bash
+aggrs -s ':' -k 7 /etc/passwd    # login shells
+aggrs -s '\t' -k 2 data.tsv       # tab-separated values
+```
 
 ### Reading from stdin
 

@@ -555,7 +555,7 @@ impl AggregateMap {
             .map(|chunk| {
                 let mut amap = AggregateMap::new();
                 let mut local_entries = 0u64;
-                let chunk_str = unsafe { std::str::from_utf8_unchecked(chunk) };
+                let chunk_str: &'static str = unsafe { std::str::from_utf8_unchecked(chunk) };
 
                 for mut line in chunk_str.split('\n') {
                     if line.ends_with('\r') {
@@ -614,7 +614,71 @@ enum ParserType {
 enum Aggregate {
     Json(SelectiveVisitor),
     Csv(Vec<usize>),
-    Text(bool),
+    /// Plain text: `None` aggregates whole lines, `Some` tokenizes them.
+    Text(Option<Tokenizer>),
+}
+
+/// Plain-text tokenization settings (`-t`, `-s <SEP>`, `-k <COLUMN>`).
+#[derive(Debug, Clone, Default)]
+struct Tokenizer {
+    /// Field separator; `None` splits on runs of whitespace.
+    separator: Option<String>,
+    /// 0-based columns to extract, in the requested order; empty means all tokens.
+    columns: Vec<usize>,
+    /// Highest requested column (only meaningful when `columns` is non-empty).
+    max_column: usize,
+}
+
+impl Tokenizer {
+    fn new(opt: &Options) -> Result<Self> {
+        let separator = match opt.separator.as_deref() {
+            None => None,
+            Some("") => return Err(anyhow::anyhow!("separator must not be empty")),
+            Some(s) => Some(s.replace("\\t", "\t")),
+        };
+
+        let columns = opt
+            .keys
+            .iter()
+            .map(|k| match k.parse::<usize>() {
+                Ok(n) if n >= 1 => Ok(n - 1),
+                _ => Err(anyhow::anyhow!(
+                    "invalid column '{}': in tokenize mode -k expects a column number starting from 1",
+                    k
+                )),
+            })
+            .collect::<Result<Vec<usize>>>()?;
+
+        let max_column = columns.iter().copied().max().unwrap_or(0);
+
+        Ok(Self {
+            separator,
+            columns,
+            max_column,
+        })
+    }
+
+    #[inline]
+    fn tokenize(&self, line: &'static str) -> Vec<SmolValue> {
+        match &self.separator {
+            Some(sep) => self.select(line.split(sep.as_str())),
+            None => self.select(line.split_whitespace()),
+        }
+    }
+
+    /// Keeps all tokens, or only the requested columns (missing columns become `null`).
+    #[inline]
+    fn select<I: Iterator<Item = &'static str>>(&self, tokens: I) -> Vec<SmolValue> {
+        let to_value = |s: &'static str| SmolValue::String(SmolStr::new_static(s));
+        if self.columns.is_empty() {
+            return tokens.map(to_value).collect();
+        }
+        let fields: Vec<&'static str> = tokens.take(self.max_column + 1).collect();
+        self.columns
+            .iter()
+            .map(|&c| fields.get(c).map_or(SmolValue::Null, |&s| to_value(s)))
+            .collect()
+    }
 }
 
 impl Aggregate {
@@ -641,11 +705,26 @@ impl Aggregate {
 
                 Ok(Aggregate::Csv(pos))
             }
-            ParserType::Text => Ok(Aggregate::Text(opt.tokenize)),
+            ParserType::Text => {
+                if opt.is_tokenize() {
+                    Ok(Aggregate::Text(Some(Tokenizer::new(opt)?)))
+                } else {
+                    Ok(Aggregate::Text(None))
+                }
+            }
         }
     }
 
     fn get_parse_type(opt: &Options) -> Result<ParserType> {
+        if opt.is_tokenize() {
+            if opt.file_format.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--file-format cannot be combined with --tokenize/--separator"
+                ));
+            }
+            return Ok(ParserType::Text);
+        }
+
         if opt.keys.is_empty() {
             return Ok(ParserType::Text);
         }
@@ -680,42 +759,41 @@ impl Aggregate {
     }
 
     #[inline]
-    fn parse_values(&self, line: &str) -> Result<Vec<SmolValue>> {
+    fn parse_values(&self, line: &'static str) -> Result<Vec<SmolValue>> {
         match self {
             Aggregate::Json(visitor) => Ok(visitor.get_values_by_keys(line)?),
             Aggregate::Csv(pos) => {
-                let mut rdr = ReaderBuilder::new()
-                    .has_headers(false)
-                    .from_reader(line.as_bytes());
-
                 let mut res = Vec::with_capacity(pos.len());
+                if memchr::memchr(b'"', line.as_bytes()).is_none() {
+                    for &p in pos {
+                        let s = line
+                            .split(',')
+                            .nth(p)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))?;
+                        res.push(SmolValue::String(SmolStr::new_static(s)));
+                    }
+                } else {
+                    let mut rdr = ReaderBuilder::new()
+                        .has_headers(false)
+                        .from_reader(line.as_bytes());
 
-                let record = rdr
-                    .records()
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))??;
+                    let record = rdr
+                        .records()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))??;
 
-                for p in pos {
-                    let s: &'static str = unsafe { std::mem::transmute(record.get(*p).unwrap()) };
-                    res.push(SmolValue::String(SmolStr::new_static(s)));
+                    for &p in pos {
+                        let s = record
+                            .get(p)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid CSV record"))?;
+                        res.push(SmolValue::String(SmolStr::new(s)));
+                    }
                 }
 
                 Ok(res)
             }
-            Aggregate::Text(tok) => {
-                if *tok {
-                    Ok(line
-                        .split_whitespace()
-                        .map(|s| {
-                            let s: &'static str = unsafe { std::mem::transmute(s) };
-                            SmolValue::String(SmolStr::new_static(s))
-                        })
-                        .collect())
-                } else {
-                    let s: &'static str = unsafe { std::mem::transmute(line) };
-                    Ok(vec![SmolValue::String(SmolStr::new_static(s))])
-                }
-            }
+            Aggregate::Text(None) => Ok(vec![SmolValue::String(SmolStr::new_static(line))]),
+            Aggregate::Text(Some(tok)) => Ok(tok.tokenize(line)),
         }
     }
 }
@@ -762,4 +840,69 @@ pub fn run(opt: Options) -> Result<()> {
     std::mem::forget(amap);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_parse_values_unquoted_and_quoted() {
+        let visitor = Aggregate::Csv(vec![7, 0]);
+        let line1: &'static str =
+            "tcp,http,google,192.168.1.100,172.217.14.110,54321,80,15000,120,US,search";
+        let vals1 = visitor.parse_values(line1).unwrap();
+        assert_eq!(vals1[0].to_string(), "15000");
+        assert_eq!(vals1[1].to_string(), "tcp");
+
+        let line2: &'static str =
+            r#"tcp,"http,2",google,192.168.1.100,172.217.14.110,54321,80,"25000",120,US,search"#;
+        let vals2 = visitor.parse_values(line2).unwrap();
+        assert_eq!(vals2[0].to_string(), "25000");
+        assert_eq!(vals2[1].to_string(), "tcp");
+    }
+
+    fn tokenizer(separator: Option<&str>, keys: &[&str]) -> Result<Tokenizer> {
+        let opt = Options {
+            tokenize: separator.is_none(),
+            separator: separator.map(str::to_string),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            ..Default::default()
+        };
+        Tokenizer::new(&opt)
+    }
+
+    fn strings(values: Vec<SmolValue>) -> Vec<String> {
+        values.into_iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn tokenize_whitespace_all_and_columns() {
+        let line: &'static str = "GET  /index\t200";
+        let all = tokenizer(None, &[]).unwrap();
+        assert_eq!(strings(all.tokenize(line)), ["GET", "/index", "200"]);
+
+        let cols = tokenizer(None, &["3", "1"]).unwrap();
+        assert_eq!(strings(cols.tokenize(line)), ["200", "GET"]);
+    }
+
+    #[test]
+    fn tokenize_custom_separator_keeps_empty_fields() {
+        let line: &'static str = "a;;c";
+        let tok = tokenizer(Some(";"), &["2", "3", "5"]).unwrap();
+        assert_eq!(strings(tok.tokenize(line)), ["", "c", "null"]);
+
+        let tab = tokenizer(Some("\\t"), &["2"]).unwrap();
+        assert_eq!(strings(tab.tokenize("x y\tz")), ["z"]);
+
+        let multi = tokenizer(Some("::"), &[]).unwrap();
+        assert_eq!(strings(multi.tokenize("a::b:c")), ["a", "b:c"]);
+    }
+
+    #[test]
+    fn tokenize_rejects_invalid_columns_and_empty_separator() {
+        assert!(tokenizer(None, &["0"]).is_err());
+        assert!(tokenizer(None, &["name"]).is_err());
+        assert!(tokenizer(Some(""), &[]).is_err());
+    }
 }

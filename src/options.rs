@@ -14,11 +14,22 @@ pub struct Options {
     #[clap(long, help = "Display counters to the right of bucket names")]
     pub counters_to_right: bool,
 
-    #[clap(short, long, help = "Specify the JSON/CSV keys to aggregate")]
+    #[clap(
+        short,
+        long,
+        help = "Specify the JSON/CSV keys to aggregate (column numbers starting from 1 in tokenize mode)"
+    )]
     pub keys: Vec<String>,
 
-    #[clap(short, long, help = "Tokenize lines (used for non JSON input)")]
+    #[clap(short, long, help = "Tokenize lines by whitespace (used for non JSON input)")]
     pub tokenize: bool,
+
+    #[clap(
+        short,
+        long,
+        help = "Tokenize lines using the given separator (implies --tokenize, \\t for tab)"
+    )]
+    pub separator: Option<String>,
 
     #[clap(short, long, help = "Filter buckets by regular expression")]
     pub filter: Option<regex::Regex>,
@@ -46,6 +57,12 @@ pub struct Options {
 }
 
 impl Options {
+    /// True when plain-text tokenization is requested (`-t` or `-s`).
+    #[inline]
+    pub fn is_tokenize(&self) -> bool {
+        self.tokenize || self.separator.is_some()
+    }
+
     #[inline]
     pub fn colorize(&self, s: &str) -> String {
         if self.colors {
